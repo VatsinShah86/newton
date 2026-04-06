@@ -390,8 +390,17 @@ def compute_world_offsets(
 
 
 def get_examples() -> dict[str, str]:
-    """Return a dict mapping example short names to their full module paths."""
+    """Return a dict mapping example aliases to their full module paths.
+
+    Unique examples are registered under their short name (for example
+    ``softbody_franka``). All examples are also registered under a qualified
+    ``<category>.<name>`` alias (for example
+    ``data_collection.softbody_franka``) so subpackages can safely contain
+    colliding short names.
+    """
     example_map = {}
+    qualified_map = {}
+    duplicate_names = set()
     examples_dir = get_source_directory()
     for module in sorted(os.listdir(examples_dir)):
         module_dir = os.path.join(examples_dir, module)
@@ -400,7 +409,17 @@ def get_examples() -> dict[str, str]:
         for filename in sorted(os.listdir(module_dir)):
             if filename.startswith("example_") and filename.endswith(".py"):
                 example_name = filename[8:-3]
-                example_map[example_name] = f"newton.examples.{module}.{filename[:-3]}"
+                module_path = f"newton.examples.{module}.{filename[:-3]}"
+                qualified_map[f"{module}.{example_name}"] = module_path
+                if example_name in example_map and example_map[example_name] != module_path:
+                    duplicate_names.add(example_name)
+                else:
+                    example_map[example_name] = module_path
+
+    for example_name in duplicate_names:
+        example_map.pop(example_name, None)
+
+    example_map.update(qualified_map)
     return example_map
 
 
@@ -460,6 +479,30 @@ def create_parser():
         const=None,
         metavar="SECONDS",
         help="Run in benchmark mode: measure FPS after a warmup period. If SECONDS is given, stop after that many seconds or --num-frames, whichever comes first.",
+    )
+    parser.add_argument(
+        "--video-output-path",
+        type=str,
+        default=None,
+        help="When using the null viewer, record an MP4 to this path.",
+    )
+    parser.add_argument(
+        "--video-width",
+        type=int,
+        default=1280,
+        help="Video width in pixels for null-viewer recording.",
+    )
+    parser.add_argument(
+        "--video-height",
+        type=int,
+        default=720,
+        help="Video height in pixels for null-viewer recording.",
+    )
+    parser.add_argument(
+        "--video-fps",
+        type=int,
+        default=60,
+        help="Video frame rate for null-viewer recording.",
     )
 
     return parser
@@ -571,10 +614,18 @@ def init(parser=None):
     elif args.viewer == "rerun":
         viewer = newton.viewer.ViewerRerun(address=args.rerun_address)
     elif args.viewer == "null":
+        video_output_path = args.video_output_path
+        if video_output_path is None and not args.test and args.benchmark is False:
+            video_output_path = "output.mp4"
         viewer = newton.viewer.ViewerNull(
             num_frames=args.num_frames,
             benchmark=args.benchmark is not False,
             benchmark_timeout=args.benchmark or None,
+            video_output_path=video_output_path,
+            video_width=args.video_width,
+            video_height=args.video_height,
+            video_fps=args.video_fps,
+            strict_recording=args.video_output_path is not None,
         )
     elif args.viewer == "viser":
         viewer = newton.viewer.ViewerViser()

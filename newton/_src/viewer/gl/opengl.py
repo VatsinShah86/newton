@@ -921,6 +921,8 @@ class RendererGL:
 
             # disable error checking for performance
             pyglet.options["debug_gl"] = False
+            if headless:
+                pyglet.options["headless"] = True
 
             # try imports
             from pyglet.graphics.shader import Shader, ShaderProgram  # noqa: F401

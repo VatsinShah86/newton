@@ -1224,45 +1224,14 @@ class ViewerGL(ViewerBase):
         gl = RendererGL.gl
         w, h = self.renderer._screen_width, self.renderer._screen_height
 
-        # Lazy initialization of PBO (Pixel Buffer Object).
-        if self._pbo is None:
-            pbo_id = (gl.GLuint * 1)()
-            gl.glGenBuffers(1, pbo_id)
-            self._pbo = pbo_id[0]
-
-            # Allocate PBO storage.
-            gl.glBindBuffer(gl.GL_PIXEL_PACK_BUFFER, self._pbo)
-            gl.glBufferData(gl.GL_PIXEL_PACK_BUFFER, gl.GLsizeiptr(w * h * 3), None, gl.GL_STREAM_READ)
-            gl.glBindBuffer(gl.GL_PIXEL_PACK_BUFFER, 0)
-
-            # Register with CUDA.
-            self._wp_pbo = wp.RegisteredGLBuffer(
-                gl_buffer_id=int(self._pbo),
-                device=self.device,
-                flags=wp.RegisteredGLBuffer.READ_ONLY,
-            )
-
-            # Set alignment once.
-            gl.glPixelStorei(gl.GL_PACK_ALIGNMENT, 1)
-
-        # GPU-to-GPU readback into PBO.
         assert self.renderer._frame_fbo is not None
         gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, self.renderer._frame_fbo)
-        gl.glBindBuffer(gl.GL_PIXEL_PACK_BUFFER, self._pbo)
 
         if render_ui and self.ui:
             self.ui.begin_frame()
             self._render_ui()
             self.ui.end_frame()
             self.ui.render()
-
-        gl.glReadPixels(0, 0, w, h, gl.GL_RGB, gl.GL_UNSIGNED_BYTE, ctypes.c_void_p(0))
-        gl.glBindBuffer(gl.GL_PIXEL_PACK_BUFFER, 0)
-        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, 0)
-
-        # Map PBO buffer and copy using RGB kernel.
-        assert self._wp_pbo is not None
-        buf = self._wp_pbo.map(dtype=wp.uint8, shape=(w * h * 3,))
 
         if target_image is None:
             target_image = wp.empty(
@@ -1274,17 +1243,63 @@ class ViewerGL(ViewerBase):
         if target_image.shape != (h, w, 3):
             raise ValueError(f"Shape of `target_image` must be ({h}, {w}, 3), got {target_image.shape}")
 
-        # Launch the RGB kernel.
-        wp.launch(
-            copy_rgb_frame_uint8,
-            dim=(w, h),
-            inputs=[buf, w, h],
-            outputs=[target_image],
-            device=self.device,
-        )
+        gl.glPixelStorei(gl.GL_PACK_ALIGNMENT, 1)
 
-        # Unmap the PBO buffer.
-        self._wp_pbo.unmap()
+        if self.device.is_cuda:
+            # Lazy initialization of PBO (Pixel Buffer Object).
+            if self._pbo is None:
+                pbo_id = (gl.GLuint * 1)()
+                gl.glGenBuffers(1, pbo_id)
+                self._pbo = pbo_id[0]
+
+                # Allocate PBO storage.
+                gl.glBindBuffer(gl.GL_PIXEL_PACK_BUFFER, self._pbo)
+                gl.glBufferData(gl.GL_PIXEL_PACK_BUFFER, gl.GLsizeiptr(w * h * 3), None, gl.GL_STREAM_READ)
+                gl.glBindBuffer(gl.GL_PIXEL_PACK_BUFFER, 0)
+
+                # Register with CUDA.
+                self._wp_pbo = wp.RegisteredGLBuffer(
+                    gl_buffer_id=int(self._pbo),
+                    device=self.device,
+                    flags=wp.RegisteredGLBuffer.READ_ONLY,
+                )
+
+            # GPU-to-GPU readback into PBO.
+            gl.glBindBuffer(gl.GL_PIXEL_PACK_BUFFER, self._pbo)
+            gl.glReadPixels(0, 0, w, h, gl.GL_RGB, gl.GL_UNSIGNED_BYTE, ctypes.c_void_p(0))
+            gl.glBindBuffer(gl.GL_PIXEL_PACK_BUFFER, 0)
+            gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, 0)
+
+            # Map PBO buffer and copy using RGB kernel.
+            assert self._wp_pbo is not None
+            buf = self._wp_pbo.map(dtype=wp.uint8, shape=(w * h * 3,))
+
+            wp.launch(
+                copy_rgb_frame_uint8,
+                dim=(w, h),
+                inputs=[buf, w, h],
+                outputs=[target_image],
+                device=self.device,
+            )
+
+            # Unmap the PBO buffer.
+            self._wp_pbo.unmap()
+            return target_image
+
+        host_image = np.empty((h, w, 3), dtype=np.uint8)
+        gl.glReadPixels(
+            0,
+            0,
+            w,
+            h,
+            gl.GL_RGB,
+            gl.GL_UNSIGNED_BYTE,
+            host_image.ctypes.data_as(ctypes.POINTER(ctypes.c_ubyte)),
+        )
+        gl.glBindFramebuffer(gl.GL_FRAMEBUFFER, 0)
+
+        source_image = wp.array(np.flipud(host_image).copy(), dtype=wp.uint8, device="cpu")
+        wp.copy(target_image, source_image)
 
         return target_image
 

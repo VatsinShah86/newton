@@ -15,7 +15,10 @@
 
 from __future__ import annotations
 
+import subprocess
 import time as _time
+import warnings
+from pathlib import Path
 from typing import Any
 
 import numpy as np
@@ -43,6 +46,11 @@ class ViewerNull(ViewerBase):
         benchmark: bool = False,
         benchmark_timeout: float | None = None,
         benchmark_start_frame: int = 3,
+        video_output_path: str | None = None,
+        video_width: int = 1280,
+        video_height: int = 720,
+        video_fps: int = 60,
+        strict_recording: bool = False,
     ):
         """
         Initialize a no-op Viewer that runs for a fixed number of frames.
@@ -55,6 +63,11 @@ class ViewerNull(ViewerBase):
                 enables *benchmark*.
             benchmark_start_frame: Number of warmup frames before benchmark
                 timing starts.
+            video_output_path: Optional MP4 output path for offscreen recording.
+            video_width: Recording width in pixels.
+            video_height: Recording height in pixels.
+            video_fps: Recording frame rate.
+            strict_recording: Raise instead of warning if recording setup fails.
         """
         super().__init__()
 
@@ -67,6 +80,37 @@ class ViewerNull(ViewerBase):
         self._bench_start_time: float | None = None
         self._bench_frames = 0
         self._bench_elapsed = 0.0
+        self._video_recorder: _NullVideoRecorder | None = None
+
+        if video_output_path is not None:
+            try:
+                self._video_recorder = _NullVideoRecorder(
+                    output_path=video_output_path,
+                    width=video_width,
+                    height=video_height,
+                    fps=video_fps,
+                )
+            except Exception as exc:
+                if strict_recording:
+                    raise
+                warnings.warn(f"Failed to initialize null-viewer recording: {exc}", stacklevel=2)
+
+    @override
+    def set_model(self, model: newton.Model | None, max_worlds: int | None = None):
+        if self._video_recorder is not None:
+            self._video_recorder.set_model(model, max_worlds=max_worlds)
+        super().set_model(model, max_worlds=max_worlds)
+
+    @override
+    def set_camera(self, pos: wp.vec3, pitch: float, yaw: float):
+        if self._video_recorder is not None:
+            self._video_recorder.set_camera(pos, pitch, yaw)
+
+    @override
+    def set_world_offsets(self, spacing: tuple[float, float, float] | list[float] | wp.vec3):
+        super().set_world_offsets(spacing)
+        if self._video_recorder is not None:
+            self._video_recorder.set_world_offsets(spacing)
 
     @override
     def log_mesh(
@@ -93,7 +137,17 @@ class ViewerNull(ViewerBase):
             hidden: Whether the mesh is hidden.
             backface_culling: Whether to enable backface culling.
         """
-        pass
+        if self._video_recorder is not None:
+            self._video_recorder.log_mesh(
+                name,
+                points,
+                indices,
+                normals=normals,
+                uvs=uvs,
+                texture=texture,
+                hidden=hidden,
+                backface_culling=backface_culling,
+            )
 
     @override
     def log_instances(
@@ -118,7 +172,8 @@ class ViewerNull(ViewerBase):
             materials: Instance materials.
             hidden: Whether the instances are hidden.
         """
-        pass
+        if self._video_recorder is not None:
+            self._video_recorder.log_instances(name, mesh, xforms, scales, colors, materials, hidden=hidden)
 
     @override
     def begin_frame(self, time: float):
@@ -128,7 +183,9 @@ class ViewerNull(ViewerBase):
         Args:
             time: The current simulation time.
         """
-        pass
+        super().begin_frame(time)
+        if self._video_recorder is not None:
+            self._video_recorder.begin_frame(time)
 
     @override
     def end_frame(self):
@@ -145,6 +202,9 @@ class ViewerNull(ViewerBase):
                 wp.synchronize()
                 self._bench_frames = self.frame_count - self.benchmark_start_frame
                 self._bench_elapsed = _time.perf_counter() - self._bench_start_time
+
+        if self._video_recorder is not None:
+            self._video_recorder.end_frame()
 
     @override
     def is_running(self) -> bool:
@@ -187,7 +247,8 @@ class ViewerNull(ViewerBase):
         """
         No-op implementation for closing the viewer.
         """
-        pass
+        if self._video_recorder is not None:
+            self._video_recorder.close()
 
     @override
     def log_lines(
@@ -212,7 +273,8 @@ class ViewerNull(ViewerBase):
             width: Line width hint.
             hidden: Whether the lines are hidden.
         """
-        pass
+        if self._video_recorder is not None:
+            self._video_recorder.log_lines(name, starts, ends, colors, width=width, hidden=hidden)
 
     @override
     def log_points(
@@ -235,7 +297,8 @@ class ViewerNull(ViewerBase):
             colors: Point colors.
             hidden: Whether the points are hidden.
         """
-        pass
+        if self._video_recorder is not None:
+            self._video_recorder.log_points(name, points, radii=radii, colors=colors, hidden=hidden)
 
     @override
     def log_array(self, name: str, array: wp.array(dtype=Any) | nparray):
@@ -246,7 +309,8 @@ class ViewerNull(ViewerBase):
             name: Name of the array.
             array: The array data.
         """
-        pass
+        if self._video_recorder is not None:
+            self._video_recorder.log_array(name, array)
 
     @override
     def log_scalar(self, name: str, value: int | float | bool | np.number):
@@ -257,7 +321,188 @@ class ViewerNull(ViewerBase):
             name: Name of the scalar.
             value: The scalar value.
         """
-        pass
+        if self._video_recorder is not None:
+            self._video_recorder.log_scalar(name, value)
+
+    @override
+    def apply_forces(self, state: newton.State):
+        """
+        No-op implementation for viewer-driven forces.
+
+        Args:
+            state: The current state.
+        """
+        del state
+
+
+class _NullVideoRecorder:
+    """Headless OpenGL renderer that records frames to an MP4 via ffmpeg."""
+
+    def __init__(self, output_path: str, width: int, height: int, fps: int):
+        from .viewer_gl import ViewerGL  # noqa: PLC0415
+
+        self.output_path = Path(output_path)
+        self.output_path.parent.mkdir(parents=True, exist_ok=True)
+        self.width = width
+        self.height = height
+        self.fps = fps
+        self.frame_count = 0
+        self._process: subprocess.Popen | None = None
+        self._render_viewer = ViewerGL(width=width, height=height, headless=True)
+        self._gpu_frame: wp.array | None = None
+        self._cpu_frame: wp.array | None = None
+
+    def _start_process(self):
+        if self._process is not None:
+            return
+
+        command = [
+            "ffmpeg",
+            "-y",
+            "-f",
+            "rawvideo",
+            "-pix_fmt",
+            "rgb24",
+            "-s",
+            f"{self.width}x{self.height}",
+            "-r",
+            str(self.fps),
+            "-i",
+            "-",
+            "-an",
+            "-c:v",
+            "libx264",
+            "-vf",
+            "pad=ceil(iw/2)*2:ceil(ih/2)*2",
+            "-pix_fmt",
+            "yuv420p",
+            str(self.output_path),
+        ]
+        self._process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+
+    def set_model(self, model: newton.Model | None, max_worlds: int | None = None):
+        self._render_viewer.set_model(model, max_worlds=max_worlds)
+
+    def set_camera(self, pos: wp.vec3, pitch: float, yaw: float):
+        self._render_viewer.set_camera(pos, pitch, yaw)
+
+    def set_world_offsets(self, spacing: tuple[float, float, float] | list[float] | wp.vec3):
+        self._render_viewer.set_world_offsets(spacing)
+
+    def begin_frame(self, time: float):
+        self._render_viewer.begin_frame(time)
+
+    def end_frame(self):
+        self._render_viewer.end_frame()
+        frame = self._render_viewer.get_frame(target_image=self._get_render_buffer())
+        frame_np = self._frame_to_numpy(frame)
+
+        self._start_process()
+        assert self._process is not None
+        assert self._process.stdin is not None
+        self._process.stdin.write(np.ascontiguousarray(frame_np).tobytes())
+        self.frame_count += 1
+
+    def close(self):
+        process = self._process
+        if process is not None:
+            assert process.stdin is not None
+            process.stdin.close()
+            stderr = process.stderr.read().decode("utf-8", errors="replace") if process.stderr is not None else ""
+            return_code = process.wait()
+            if return_code != 0:
+                raise RuntimeError(f"ffmpeg failed while writing {self.output_path}: {stderr.strip()}")
+
+        self._render_viewer.close()
+
+    def _get_render_buffer(self) -> wp.array:
+        if self._gpu_frame is None:
+            self._gpu_frame = wp.empty((self.height, self.width, 3), dtype=wp.uint8, device=self._render_viewer.device)
+        return self._gpu_frame
+
+    def _frame_to_numpy(self, frame: wp.array) -> np.ndarray:
+        if frame.device.is_cuda:
+            if self._cpu_frame is None:
+                self._cpu_frame = wp.empty(
+                    (self.height, self.width, 3),
+                    dtype=wp.uint8,
+                    device="cpu",
+                    pinned=True,
+                )
+            wp.copy(self._cpu_frame, frame)
+            wp.synchronize()
+            return self._cpu_frame.numpy()
+        return frame.numpy()
+
+    def log_mesh(
+        self,
+        name: str,
+        points: wp.array(dtype=wp.vec3),
+        indices: wp.array(dtype=wp.int32) | wp.array(dtype=wp.uint32),
+        normals: wp.array(dtype=wp.vec3) | None = None,
+        uvs: wp.array(dtype=wp.vec2) | None = None,
+        texture: np.ndarray | str | None = None,
+        hidden: bool = False,
+        backface_culling: bool = True,
+    ):
+        self._render_viewer.log_mesh(
+            name,
+            points,
+            indices,
+            normals=normals,
+            uvs=uvs,
+            texture=texture,
+            hidden=hidden,
+            backface_culling=backface_culling,
+        )
+
+    def log_instances(
+        self,
+        name: str,
+        mesh: str,
+        xforms: wp.array(dtype=wp.transform) | None,
+        scales: wp.array(dtype=wp.vec3) | None,
+        colors: wp.array(dtype=wp.vec3) | None,
+        materials: wp.array(dtype=wp.vec4) | None,
+        hidden: bool = False,
+    ):
+        self._render_viewer.log_instances(name, mesh, xforms, scales, colors, materials, hidden=hidden)
+
+    def log_lines(
+        self,
+        name: str,
+        starts: wp.array(dtype=wp.vec3) | None,
+        ends: wp.array(dtype=wp.vec3) | None,
+        colors: (
+            wp.array(dtype=wp.vec3) | wp.array(dtype=wp.float32) | tuple[float, float, float] | list[float] | None
+        ),
+        width: float = 0.01,
+        hidden: bool = False,
+    ):
+        self._render_viewer.log_lines(name, starts, ends, colors, width=width, hidden=hidden)
+
+    def log_points(
+        self,
+        name: str,
+        points: wp.array(dtype=wp.vec3) | None,
+        radii: wp.array(dtype=wp.float32) | float | None = None,
+        colors: (
+            wp.array(dtype=wp.vec3) | wp.array(dtype=wp.float32) | tuple[float, float, float] | list[float] | None
+        ) = None,
+        hidden: bool = False,
+    ):
+        self._render_viewer.log_points(name, points, radii=radii, colors=colors, hidden=hidden)
+
+    def log_array(self, name: str, array: wp.array(dtype=Any) | nparray):
+        self._render_viewer.log_array(name, array)
+
+    def log_scalar(self, name: str, value: int | float | bool | np.number):
+        self._render_viewer.log_scalar(name, value)
 
     @override
     def apply_forces(self, state: newton.State):
