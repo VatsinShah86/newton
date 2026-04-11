@@ -12,6 +12,9 @@
 
 from __future__ import annotations
 
+import atexit
+import math
+
 import numpy as np
 import warp as wp
 
@@ -20,12 +23,68 @@ import newton.examples
 import newton.utils
 from newton import ModelBuilder, State, eval_fk
 from newton.math import transform_twist
+from newton.sensors import SensorTiledCamera
 from newton.solvers import SolverFeatherstone
 from newton.examples.data_collection.oculus_teleop import QuestStream
 
 GRIPPER_SPEED = 0.05   # m/s — full stroke (0 → 0.04 m) in ~0.8 s
 GRIPPER_MAX   = 0.04   # m, fully open (Franka finger travel limit)
 GRIPPER_MIN   = 0.0    # m, fully closed
+
+CAMERA_AXIS_LEN = 0.05  # m, length of each displayed frame axis
+CAMERA_WIDTH    = 640
+CAMERA_HEIGHT   = 480
+CAMERA_FOV_DEG  = 60.0
+
+
+@wp.kernel
+def _update_camera_transform(
+    body_q: wp.array(dtype=wp.transform),
+    body_id: int,
+    offset: wp.transform,
+    out: wp.array(dtype=wp.transformf, ndim=2),
+):
+    """Write the camera world transform into the (camera, world) sensor array."""
+    out[0, 0] = body_q[body_id] * offset
+
+
+@wp.kernel
+def _compute_frame_lines(
+    body_q: wp.array(dtype=wp.transform),
+    body_id: int,
+    offset: wp.transform,
+    axis_len: float,
+    starts: wp.array(dtype=wp.vec3),
+    ends: wp.array(dtype=wp.vec3),
+):
+    """One thread per axis (0=X, 1=Y, 2=Z): compute start/end in world space."""
+    i = wp.tid()
+    cam_tf = body_q[body_id] * offset
+    origin = wp.transform_get_translation(cam_tf)
+    starts[i] = origin
+    if i == 0:
+        ends[i] = origin + wp.transform_vector(cam_tf, wp.vec3(axis_len, 0.0, 0.0))
+    elif i == 1:
+        ends[i] = origin + wp.transform_vector(cam_tf, wp.vec3(0.0, axis_len, 0.0))
+    else:
+        ends[i] = origin + wp.transform_vector(cam_tf, wp.vec3(0.0, 0.0, axis_len))
+
+
+@wp.kernel
+def _depth_to_point_cloud(
+    depth: wp.array(dtype=wp.float32, ndim=4),    # (worlds, cameras, H, W)
+    rays: wp.array(dtype=wp.vec3f, ndim=4),        # (cameras, H, W, 2) — [..,0]=origin [..,1]=dir
+    cam_tf: wp.array(dtype=wp.transformf, ndim=2), # (cameras, worlds)
+    out: wp.array(dtype=wp.vec3f, ndim=2),         # (H, W) — zero vec = no hit
+):
+    y, x = wp.tid()
+    d = depth[0, 0, y, x]
+    if d <= 0.0:
+        out[y, x] = wp.vec3f(0.0, 0.0, 0.0)
+        return
+    tf = cam_tf[0, 0]
+    ray_dir_world = wp.transform_vector(tf, rays[0, y, x, 1])
+    out[y, x] = wp.transform_get_translation(tf) + d * ray_dir_world
 
 
 class Example:
@@ -62,6 +121,37 @@ class Example:
         self.gravity_earth = wp.array([wp.vec3(0.0, 0.0, -9.81)], dtype=wp.vec3)
 
         self.oculus = QuestStream(ip=oculus_ip) if oculus_ip is not None else None
+
+        # Camera mount frame: placed at the TCP (0.22 m along body-7 z-axis).
+        # Adjust this transform to move/orient the camera relative to the TCP.
+        self.camera_offset = wp.transform(wp.vec3(0.052, 0.0, 0.135), wp.quat(1.0, 0.0, 0.0, 0.0))
+        self._cam_starts = wp.zeros(3, dtype=wp.vec3)
+        self._cam_ends   = wp.zeros(3, dtype=wp.vec3)
+        self._cam_colors = wp.array(
+            [wp.vec3(1.0, 0.0, 0.0), wp.vec3(0.0, 1.0, 0.0), wp.vec3(0.0, 0.0, 1.0)],
+            dtype=wp.vec3,
+        )
+
+        # (camera_count=1, world_count=1) transform buffer for the sensor
+        self._cam_tf = wp.zeros((1, 1), dtype=wp.transformf)
+
+        self.camera_sensor = SensorTiledCamera(
+            model=self.model,
+            config=SensorTiledCamera.Config(
+                default_light=True,
+                default_light_shadows=True,
+                backface_culling=True,
+            ),
+        )
+        self._cam_rays = self.camera_sensor.compute_pinhole_camera_rays(
+            CAMERA_WIDTH, CAMERA_HEIGHT, [math.radians(CAMERA_FOV_DEG)]
+        )
+        self._cam_depth = self.camera_sensor.create_depth_image_output(
+            CAMERA_WIDTH, CAMERA_HEIGHT, camera_count=1
+        )
+        self.cam_point_cloud = wp.zeros((CAMERA_HEIGHT, CAMERA_WIDTH), dtype=wp.vec3f)
+        self._first_cloud_np = None
+        atexit.register(self._save_first_cloud)
 
         self.viewer.set_model(self.model)
         self.viewer.set_camera(wp.vec3(-0.6, 0.6, 1.24), -42.0, -58.0)
@@ -177,6 +267,14 @@ class Example:
         joint_qd = (np.linalg.pinv(J) @ ee_delta / self.frame_dt).astype(np.float32)
         self.target_joint_qd.assign(joint_qd)
 
+    def _save_first_cloud(self):
+        if self._first_cloud_np is None:
+            return
+        path = "first_point_cloud.npy"
+        np.save(path, self._first_cloud_np)
+        n_valid = (self._first_cloud_np != 0).any(axis=-1).sum()
+        print(f"Saved first point cloud: {self._first_cloud_np.shape}, {n_valid} valid points → {path}")
+
     def apply_gripper(self, gripper_cmd: float):
         """Move fingers toward open or closed at a fixed speed.
 
@@ -207,7 +305,31 @@ class Example:
         self.apply_ee_delta(delta_pos, delta_rot)
         self.apply_gripper(gripper_cmd)
         self.simulate()
+        self._sense()
         self.sim_time += self.frame_dt
+
+    def _sense(self):
+        wp.launch(
+            _update_camera_transform,
+            dim=1,
+            inputs=[self.state_0.body_q, self.endeffector_id, self.camera_offset],
+            outputs=[self._cam_tf],
+        )
+        self.camera_sensor.update(
+            self.state_0,
+            self._cam_tf,
+            self._cam_rays,
+            color_image=None,
+            depth_image=self._cam_depth,
+        )
+        wp.launch(
+            _depth_to_point_cloud,
+            dim=(CAMERA_HEIGHT, CAMERA_WIDTH),
+            inputs=[self._cam_depth, self._cam_rays, self._cam_tf],
+            outputs=[self.cam_point_cloud],
+        )
+        if self._first_cloud_np is None:
+            self._first_cloud_np = self.cam_point_cloud.numpy().copy()
 
     def simulate(self):
         for _ in range(self.sim_substeps):
@@ -227,8 +349,17 @@ class Example:
     def render(self):
         if self.viewer is None:
             return
+
+        wp.launch(
+            _compute_frame_lines,
+            dim=3,
+            inputs=[self.state_0.body_q, self.endeffector_id, self.camera_offset, CAMERA_AXIS_LEN],
+            outputs=[self._cam_starts, self._cam_ends],
+        )
+
         self.viewer.begin_frame(self.sim_time)
         self.viewer.log_state(self.state_0)
+        self.viewer.log_lines("/camera_frame", self._cam_starts, self._cam_ends, self._cam_colors)
         self.viewer.end_frame()
 
     def test_final(self):

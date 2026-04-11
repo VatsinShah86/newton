@@ -76,14 +76,30 @@ def visualize_depth(file_path):
 
 
 def visualize_pc(file_path):
-    """Visualizes a point cloud .npy file."""
+    """Visualizes a point cloud .npy file.
+
+    Accepts either shape (N, 3) or (H, W, 3). Zero vectors are treated as
+    invalid pixels and filtered out before plotting.
+    """
     try:
         data = np.load(file_path)
         print(f"Loaded point cloud data from {file_path}")
         print(f"Data shape: {data.shape}")
         print(f"Data type: {data.dtype}")
+
+        # Normalise to (N, 3)
+        if data.ndim == 3 and data.shape[2] == 3:
+            data = data.reshape(-1, 3)
         if data.ndim != 2 or data.shape[1] != 3:
-            raise ValueError(f"Expected point cloud shape (N, 3), got {data.shape}")
+            raise ValueError(f"Expected point cloud shape (N, 3) or (H, W, 3), got {data.shape}")
+
+        # Remove invalid (zero) points
+        valid = (data != 0).any(axis=1)
+        data = data[valid]
+        print(f"Valid points: {data.shape[0]}")
+        if data.shape[0] == 0:
+            print("No valid points to display.")
+            return
 
         try:
             from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
@@ -140,14 +156,17 @@ def visualize_act(file_path):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Visualize .npy files (segmentation, depth, point cloud, or actions).")
-    parser.add_argument("folder_name", type=str, help="Name of the folder containing the .npy files.")
-    parser.add_argument("file_number", type=int, nargs="?", help="The number of the .npy file to visualize (e.g., 1 for seg_1.npy).")
+    parser.add_argument("path", type=str, help="Path to a .npy file, or a folder name (legacy: requires file_number too).")
+    parser.add_argument("file_number", type=int, nargs="?", help="File number for the legacy folder/number addressing scheme.")
 
     args = parser.parse_args()
 
-    if args.file_number is None:
-        parser.error("file_number is required unless file_type is 'actions'.")
+    if args.path.endswith(".npy") or os.path.isfile(args.path):
+        file_path = args.path
+    else:
+        if args.file_number is None:
+            parser.error("file_number is required when using the legacy folder/number scheme.")
+        file_path = _resolve_point_cloud_path(args.path, args.file_number)
 
-    file_path = _resolve_point_cloud_path(args.folder_name, args.file_number)
     visualize_pc(file_path)
     
