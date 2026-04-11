@@ -24,7 +24,7 @@ import newton.utils
 from newton import ModelBuilder, State, eval_fk
 from newton.math import transform_twist
 from newton.sensors import SensorTiledCamera
-from newton.solvers import SolverFeatherstone
+from newton.solvers import SolverFeatherstone, SolverVBD
 from newton.examples.data_collection.oculus_teleop import QuestStream
 
 GRIPPER_SPEED = 0.05   # m/s — full stroke (0 → 0.04 m) in ~0.8 s
@@ -35,6 +35,14 @@ CAMERA_AXIS_LEN = 0.05  # m, length of each displayed frame axis
 CAMERA_WIDTH    = 640
 CAMERA_HEIGHT   = 480
 CAMERA_FOV_DEG  = 60.0
+
+ROPE_N_PARTICLES  = 25          # number of particles in the rope chain
+ROPE_LENGTH       = 0.5         # m, total rope length
+ROPE_RADIUS       = 0.008       # m, particle collision radius (~8 mm)
+ROPE_PARTICLE_MASS = 0.02       # kg per particle
+ROPE_KE           = 5e3         # N/m, spring stretch stiffness
+ROPE_KD           = 10.0        # N·s/m, spring damping
+ROPE_CONTACT_MARGIN = 0.015     # m, particle–body soft contact detection distance
 
 
 @wp.kernel
@@ -103,6 +111,29 @@ class Example:
         self.create_articulation(franka)
         self.scene.add_world(franka)
 
+        # Rope: particle chain lying along X at a height just above the ground,
+        # positioned within the robot's reachable workspace.
+        seg_len = ROPE_LENGTH / (ROPE_N_PARTICLES - 1)
+        rope_start = wp.vec3(-0.2, -0.3, ROPE_RADIUS + 0.002)
+        self._rope_particle_offset = self.scene.particle_count
+        for i in range(ROPE_N_PARTICLES):
+            self.scene.add_particle(
+                pos=rope_start + wp.vec3(i * seg_len, 0.0, 0.0),
+                vel=wp.vec3(0.0, 0.0, 0.0),
+                mass=ROPE_PARTICLE_MASS,
+                radius=ROPE_RADIUS,
+            )
+        for i in range(ROPE_N_PARTICLES - 1):
+            self.scene.add_spring(
+                i=self._rope_particle_offset + i,
+                j=self._rope_particle_offset + i + 1,
+                ke=ROPE_KE,
+                kd=ROPE_KD,
+                control=0.0,
+            )
+
+        # color() must be called after all particles/springs and before finalize
+        self.scene.color()
         self.scene.add_ground_plane()
         self.model = self.scene.finalize(requires_grad=False)
 
@@ -111,6 +142,37 @@ class Example:
         self.control = self.model.control()
 
         self.robot_solver = SolverFeatherstone(self.model, update_mass_matrix_interval=self.sim_substeps)
+
+        # Particle–body contact material (applied to all robot shapes)
+        self.model.soft_contact_ke = 1e4
+        self.model.soft_contact_kd = 1e-2
+        self.model.soft_contact_mu = 0.8
+
+        shape_ke = self.model.shape_material_ke.numpy()
+        shape_kd = self.model.shape_material_kd.numpy()
+        shape_mu = self.model.shape_material_mu.numpy()
+        shape_ke[...] = 5e4
+        shape_kd[...] = 1e-3
+        shape_mu[...] = 1.0
+        self.model.shape_material_ke = wp.array(shape_ke, dtype=self.model.shape_material_ke.dtype, device=self.model.device)
+        self.model.shape_material_kd = wp.array(shape_kd, dtype=self.model.shape_material_kd.dtype, device=self.model.device)
+        self.model.shape_material_mu = wp.array(shape_mu, dtype=self.model.shape_material_mu.dtype, device=self.model.device)
+
+        # VBD solver for rope particles; Featherstone handles robot rigid bodies
+        self.rope_solver = SolverVBD(
+            self.model,
+            iterations=5,
+            integrate_with_external_rigid_solver=True,
+            particle_enable_self_contact=False,
+            rigid_contact_k_start=self.model.soft_contact_ke,
+        )
+
+        # Explicit collision pipeline for particle–shape contacts
+        self.collision_pipeline = newton.CollisionPipeline(
+            self.model,
+            soft_contact_margin=ROPE_CONTACT_MARGIN,
+        )
+        self.contacts = self.collision_pipeline.contacts()
 
         eval_fk(self.model, self.model.joint_q, self.model.joint_qd, self.state_0)
 
@@ -334,15 +396,25 @@ class Example:
     def simulate(self):
         for _ in range(self.sim_substeps):
             self.state_0.clear_forces()
+            self.state_1.clear_forces()
             self.viewer.apply_forces(self.state_0)
-            self.state_0.joint_qd.assign(self.target_joint_qd)
 
-            # Disable gravity and contacts so Featherstone acts as a pure
-            # kinematic integrator (integrates q from qd, no dynamics).
+            # --- Robot step (kinematic, no particles, no gravity, no contacts) ---
+            # Hide particles from Featherstone so it acts as a pure kinematic FK
+            # integrator: integrates joint_q from joint_qd with no dynamics.
+            particle_count = self.model.particle_count
+            self.model.particle_count = 0
             self.model.gravity.assign(self.gravity_zero)
             self.model.shape_contact_pair_count = 0
+            self.state_0.joint_qd.assign(self.target_joint_qd)
             self.robot_solver.step(self.state_0, self.state_1, self.control, None, self.sim_dt)
+            self.state_0.particle_f.zero_()
+            self.model.particle_count = particle_count
             self.model.gravity.assign(self.gravity_earth)
+
+            # --- Rope step (VBD with gravity and particle–body contacts) ---
+            self.collision_pipeline.collide(self.state_0, self.contacts)
+            self.rope_solver.step(self.state_0, self.state_1, self.control, self.contacts, self.sim_dt)
 
             self.state_0, self.state_1 = self.state_1, self.state_0
 
