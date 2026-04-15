@@ -95,6 +95,49 @@ def _depth_to_point_cloud(
     out[y, x] = wp.transform_get_translation(tf) + d * ray_dir_world
 
 
+@wp.kernel
+def _compute_rope_segment_xforms(
+    particle_q: wp.array(dtype=wp.vec3),
+    particle_offset: int,
+    out_xforms: wp.array(dtype=wp.transform),
+):
+    """One thread per rope segment: compute midpoint transform oriented along the segment."""
+    i = wp.tid()
+    p0 = particle_q[particle_offset + i]
+    p1 = particle_q[particle_offset + i + 1]
+    mid = (p0 + p1) * 0.5
+    seg = p1 - p0
+    seg_len = wp.length(seg)
+    if seg_len < 1.0e-6:
+        q = wp.quat_identity()
+    else:
+        d = seg / seg_len
+        z = wp.vec3(0.0, 0.0, 1.0)
+        c = wp.dot(z, d)
+        if c > 0.9999:
+            q = wp.quat_identity()
+        elif c < -0.9999:
+            # 180° rotation around X axis
+            q = wp.quat(1.0, 0.0, 0.0, 0.0)
+        else:
+            axis = wp.normalize(wp.cross(z, d))
+            q = wp.quat_from_axis_angle(axis, wp.acos(c))
+    out_xforms[i] = wp.transform(mid, q)
+
+
+@wp.kernel
+def _compute_ee_body_out(
+    body_qd: wp.array(dtype=wp.spatial_vector),
+    ee_id: int,
+    ee_offset: wp.transform,
+    body_out: wp.array(dtype=float),
+):
+    """Compute end-effector body velocity projected through TCP offset."""
+    mv = transform_twist(ee_offset, body_qd[ee_id])
+    for i in range(6):
+        body_out[i] = mv[i]
+
+
 class Example:
     def __init__(self, viewer, args=None, oculus_ip: str | None = None):
         self.fps = 60
@@ -159,11 +202,14 @@ class Example:
         self.model.shape_material_mu = wp.array(shape_mu, dtype=self.model.shape_material_mu.dtype, device=self.model.device)
 
         # VBD solver for rope particles; Featherstone handles robot rigid bodies
+        # particle_enable_tile_solve=False: the tiled CUDA kernel assumes mesh/tet
+        # topology and crashes on pure particle+spring systems like this rope.
         self.rope_solver = SolverVBD(
             self.model,
             iterations=5,
             integrate_with_external_rigid_solver=True,
             particle_enable_self_contact=False,
+            particle_enable_tile_solve=False,
             rigid_contact_k_start=self.model.soft_contact_ke,
         )
 
@@ -218,6 +264,15 @@ class Example:
         self.viewer.set_model(self.model)
         self.viewer.set_camera(wp.vec3(-0.6, 0.6, 1.24), -42.0, -58.0)
 
+        # Rope cable rendering: represent each spring segment as a capsule
+        self.viewer.show_particles = False
+        n_segs = ROPE_N_PARTICLES - 1
+        seg_half_len = (ROPE_LENGTH / (ROPE_N_PARTICLES - 1)) * 0.5
+        self._rope_seg_xforms = wp.zeros(n_segs, dtype=wp.transform)
+        self._rope_seg_scales = wp.full(n_segs, wp.vec3(ROPE_RADIUS, ROPE_RADIUS, seg_half_len), dtype=wp.vec3)
+        brown = wp.vec3(0.45, 0.27, 0.08)
+        self._rope_seg_colors = wp.full(n_segs, brown, dtype=wp.vec3)
+
     def create_articulation(self, builder):
         asset_path = newton.utils.download_asset("franka_emika_panda")
         builder.add_urdf(
@@ -259,21 +314,6 @@ class Example:
             for i in range(6)
         ]
 
-        # kernel closed over the (fixed) end-effector body index and TCP offset
-        ee_id = self.endeffector_id
-        ee_offset = self.endeffector_offset
-
-        @wp.kernel
-        def compute_ee_body_out(
-            body_qd: wp.array(dtype=wp.spatial_vector),
-            body_out: wp.array(dtype=float),
-        ):
-            mv = transform_twist(wp.static(ee_offset), body_qd[wp.static(ee_id)])
-            for i in range(6):
-                body_out[i] = mv[i]
-
-        self._compute_ee_body_out = compute_ee_body_out
-
     def _compute_jacobian(self, state: State) -> np.ndarray:
         """Compute the 6 x n_dofs end-effector Jacobian via autodiff.
 
@@ -294,9 +334,9 @@ class Example:
         with tape:
             eval_fk(self.model, joint_q, joint_qd, self._temp_state)
             wp.launch(
-                self._compute_ee_body_out,
+                _compute_ee_body_out,
                 dim=1,
-                inputs=[self._temp_state.body_qd],
+                inputs=[self._temp_state.body_qd, self.endeffector_id, self.endeffector_offset],
                 outputs=[self._body_out],
             )
 
@@ -429,9 +469,17 @@ class Example:
             outputs=[self._cam_starts, self._cam_ends],
         )
 
+        wp.launch(
+            _compute_rope_segment_xforms,
+            dim=ROPE_N_PARTICLES - 1,
+            inputs=[self.state_0.particle_q, self._rope_particle_offset],
+            outputs=[self._rope_seg_xforms],
+        )
+
         self.viewer.begin_frame(self.sim_time)
         self.viewer.log_state(self.state_0)
         self.viewer.log_lines("/camera_frame", self._cam_starts, self._cam_ends, self._cam_colors)
+        self.viewer.log_capsules("/rope/segments", "", self._rope_seg_xforms, self._rope_seg_scales, self._rope_seg_colors, None)
         self.viewer.end_frame()
 
     def test_final(self):
