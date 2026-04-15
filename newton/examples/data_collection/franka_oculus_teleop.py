@@ -14,13 +14,13 @@ from __future__ import annotations
 
 import atexit
 import math
+import os
 
 import numpy as np
 import warp as wp
 
 import newton
 import newton.examples
-import newton.utils
 from newton import ModelBuilder, State, eval_fk
 from newton.math import transform_twist
 from newton.sensors import SensorTiledCamera
@@ -232,7 +232,6 @@ class Example:
 
         # Camera mount frame: placed at the TCP (0.22 m along body-7 z-axis).
         # Adjust this transform to move/orient the camera relative to the TCP.
-        self.camera_offset = wp.transform(wp.vec3(0.052, 0.0, 0.135), wp.quat(1.0, 0.0, 0.0, 0.0))
         self._cam_starts = wp.zeros(3, dtype=wp.vec3)
         self._cam_ends   = wp.zeros(3, dtype=wp.vec3)
         self._cam_colors = wp.array(
@@ -274,9 +273,9 @@ class Example:
         self._rope_seg_colors = wp.full(n_segs, brown, dtype=wp.vec3)
 
     def create_articulation(self, builder):
-        asset_path = newton.utils.download_asset("franka_emika_panda")
+        urdf_path = os.path.join(newton.examples.get_asset_directory(), "assets", "urdf", "franka_description", "robots", "franka_panda_gripper.urdf")
         builder.add_urdf(
-            str(asset_path / "urdf" / "fr3_franka_hand.urdf"),
+            urdf_path,
             xform=wp.transform((-0.5, -0.5, -0.1), wp.quat_identity()),
             floating=False,
             scale=1.0,
@@ -285,9 +284,24 @@ class Example:
             force_show_colliders=False,
         )
         # rest pose: arm up, slightly bent
-        builder.joint_q[:6] = [0.0, 0.0, 0.0, -1.59695, 0.0, 2.5307]
+        builder.joint_q[:7] = [0, 0, 0, -1.57079, 0, 1.57079, 0.7853]
 
         self.endeffector_id = builder.body_count - 3
+
+        # Camera offset: chain of fixed joints from panda_link7 to camera_link
+        # (fixed joints are collapsed, so camera_link is merged into panda_link7's body)
+        # panda_hand_joint: xyz=(0, 0, 0.107), rpy=(0, 0, -π/4)
+        # cam joint:        xyz=(0.03, 0, 0.05), rpy=(π, 0, 0)
+        tf_hand = wp.transform(
+            wp.vec3(0.0, 0.0, 0.107),
+            wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), -math.pi / 4),
+        )
+        tf_cam = wp.transform(
+            wp.vec3(0.03, 0.0, 0.05),
+            wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), math.pi),
+        )
+        self.camera_offset = wp.transform_multiply(tf_hand, tf_cam)
+
         # tool-center-point offset along the gripper z-axis [m]
         self.endeffector_offset = wp.transform(wp.vec3(0.0, 0.0, 0.22), wp.quat_identity())
 
