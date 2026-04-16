@@ -217,17 +217,17 @@
   <joint name="cam" type="fixed">
     <parent link="panda_hand"/>
     <child link="camera_link"/>
-    <origin rpy="3.14159265359 0 0" xyz="0.03 0 0.05"/>
+    <origin rpy="3.14159265359 0 0" xyz="0.03 0 0.0587"/>
   </joint>
   <link name="panda_leftfinger">
     <visual>
-      <origin rpy="0 3.14159265359 -1.57079632679" xyz="0.0125 0 0.02"/>
+      <origin rpy="0 3.14159265359 -1.57079632679" xyz="0.01315 0 0.0265"/>
       <geometry>
         <mesh filename="../../../umi/soft_gripper_finger.stl"/>
       </geometry>
     </visual>
     <collision>
-      <origin rpy="0 3.14159265359 -1.57079632679" xyz="0.0125 0 0.02"/>
+      <origin rpy="0 3.14159265359 -1.57079632679" xyz="0.01315 0 0.0265"/>
       <geometry>
         <mesh filename="../../../umi/soft_gripper_finger.stl"/>
       </geometry>
@@ -235,13 +235,13 @@
   </link>
   <link name="panda_rightfinger">
     <visual>
-      <origin rpy="0 3.14159265359 1.57079632679" xyz="-0.0125 0 0.02"/>
+      <origin rpy="0 3.14159265359 1.57079632679" xyz="-0.01315 0 0.0265"/>
       <geometry>
         <mesh filename="../../../umi/soft_gripper_finger.stl"/>
       </geometry>
     </visual>
     <collision>
-      <origin rpy="0 3.14159265359 1.57079632679" xyz="-0.0125 0 0.02"/>
+      <origin rpy="0 3.14159265359 1.57079632679" xyz="-0.01315 0 0.0265"/>
       <geometry>
         <mesh filename="../../../umi/soft_gripper_finger.stl"/>
       </geometry>
@@ -255,14 +255,10 @@
     <dynamics damping="10.0"/>
     <limit effort="20" lower="0.0" upper="0.04" velocity="0.2"/>
   </joint>
-  <joint name="panda_finger_joint2" type="prismatic">
+  <joint name="panda_finger_joint2" type="fixed">
     <parent link="panda_hand"/>
     <child link="panda_rightfinger"/>
     <origin rpy="0 0 0" xyz="0 0 0.0584"/>
-    <axis xyz="0 -1 0"/>
-    <dynamics damping="10.0"/>
-    <limit effort="20" lower="0.0" upper="0.04" velocity="0.2"/>
-    <mimic joint="panda_finger_joint1"/>
   </joint>
   <joint name="panda_grip_vis_joint" type="fixed">
     <parent link="panda_hand"/>

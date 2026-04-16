@@ -41,7 +41,7 @@ class PatchedOculusReader(OculusReader):
 
 
 class QuestStream:
-    def __init__(self, ip: str, pose_scaler=(2.0, 1.5), channel_signs=(1,1,1,-1,-1,1)):
+    def __init__(self, ip: str, pose_scaler=(1.0, 0.85), channel_signs=(1,1,1, -1,-1,-1)):
         self.reader = PatchedOculusReader(ip_address=ip)
         self.pos_scale = pose_scaler[0]
         self.rot_scale = pose_scaler[1]
@@ -80,9 +80,9 @@ class QuestStream:
         ])
         delta_pos = T_OCULUS_TO_ROBOT @ oculus_delta_pos
         delta_rot = np.array([
-            oculus_delta_rotvec[2],   # robot roll  = oculus rz
+            oculus_delta_rotvec[1],   # robot roll  = oculus rz
             oculus_delta_rotvec[0],   # robot pitch = oculus rx
-            oculus_delta_rotvec[1],   # robot yaw   = oculus ry
+            oculus_delta_rotvec[2],   # robot yaw   = oculus ry
         ])
 
         action = np.append(delta_pos, delta_rot)
@@ -94,22 +94,47 @@ class QuestStream:
         self.reader.stop()
 
 if __name__ == "__main__":
+    import csv
     import time
+    from pathlib import Path
 
-    oculus = QuestStream(ip='10.155.129.23')
-    dt = 1.0 / 10  # 10 Hz
+    CSV_PATH = Path(__file__).parents[3] / "teleop.csv"
+    FPS = 10
+    dt = 1.0 / FPS
 
-    while True:
-        try:
-            t0 = time.monotonic()
-            action = oculus.get_action()
-            delta_pos, delta_rot, gripper = action[:3], action[3:6], action[6]
-            print("delta_pos", delta_pos)
-            print("delta_rot", delta_rot)
-            elapsed = time.monotonic() - t0
-            time.sleep(max(0.0, dt - elapsed))
-        except KeyboardInterrupt:
-            oculus.stop()
-            break
+    oculus = QuestStream(ip='10.155.158.226')
 
-    pass
+    # Overwrite the CSV fresh on every run
+    with open(CSV_PATH, "w", newline="") as csv_file:
+        writer = csv.writer(csv_file)
+        writer.writerow([
+            "time_s",
+            "delta_pos_x", "delta_pos_y", "delta_pos_z",
+            "delta_rot_x", "delta_rot_y", "delta_rot_z",
+            "gripper",
+        ])
+
+        t_start = time.monotonic()
+        print(f"Recording to {CSV_PATH}  (Ctrl-C to stop)")
+
+        while True:
+            try:
+                t0 = time.monotonic()
+                action = oculus.get_action()
+                delta_pos, delta_rot, gripper = action[:3], action[3:6], action[6]
+
+                t_elapsed = t0 - t_start
+                writer.writerow([
+                    f"{t_elapsed:.3f}",
+                    *[f"{v:.7f}" for v in delta_pos],
+                    *[f"{v:.7f}" for v in delta_rot],
+                    f"{gripper:.1f}",
+                ])
+                csv_file.flush()
+
+                elapsed = time.monotonic() - t0
+                time.sleep(max(0.0, dt - elapsed))
+            except KeyboardInterrupt:
+                oculus.stop()
+                print(f"\nSaved {CSV_PATH}")
+                break

@@ -15,6 +15,7 @@ from __future__ import annotations
 import atexit
 import math
 import os
+import time
 
 import numpy as np
 import warp as wp
@@ -127,13 +128,22 @@ def _compute_rope_segment_xforms(
 
 @wp.kernel
 def _compute_ee_body_out(
+    body_q: wp.array(dtype=wp.transform),
     body_qd: wp.array(dtype=wp.spatial_vector),
     ee_id: int,
     ee_offset: wp.transform,
     body_out: wp.array(dtype=float),
 ):
-    """Compute end-effector body velocity projected through TCP offset."""
-    mv = transform_twist(ee_offset, body_qd[ee_id])
+    """Compute end-effector body velocity projected through TCP offset.
+
+    body_qd is stored in world frame by Newton's FK, so the TCP offset
+    translation must be rotated to world frame before computing the twist.
+    """
+    body_tf = body_q[ee_id]
+    p_local = wp.transform_get_translation(ee_offset)
+    p_world = wp.transform_vector(body_tf, p_local)
+    ee_world_offset = wp.transform(p_world, wp.quat_identity())
+    mv = transform_twist(ee_world_offset, body_qd[ee_id])
     for i in range(6):
         body_out[i] = mv[i]
 
@@ -229,6 +239,7 @@ class Example:
         self.gravity_earth = wp.array([wp.vec3(0.0, 0.0, -9.81)], dtype=wp.vec3)
 
         self.oculus = QuestStream(ip=oculus_ip) if oculus_ip is not None else None
+        self._last_step_time: float | None = None
 
         # Camera mount frame: placed at the TCP (0.22 m along body-7 z-axis).
         # Adjust this transform to move/orient the camera relative to the TCP.
@@ -286,18 +297,18 @@ class Example:
         # rest pose: arm up, slightly bent
         builder.joint_q[:7] = [0, 0, 0, -1.57079, 0, 1.57079, 0.7853]
 
-        self.endeffector_id = builder.body_count - 3
+        self.endeffector_id = builder.body_label.index("panda/panda_link7")
 
         # Camera offset: chain of fixed joints from panda_link7 to camera_link
         # (fixed joints are collapsed, so camera_link is merged into panda_link7's body)
         # panda_hand_joint: xyz=(0, 0, 0.107), rpy=(0, 0, -π/4)
-        # cam joint:        xyz=(0.03, 0, 0.05), rpy=(π, 0, 0)
+        # cam joint:        xyz=(0.03, 0, 0.0587), rpy=(π, 0, 0)
         tf_hand = wp.transform(
             wp.vec3(0.0, 0.0, 0.107),
             wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), -math.pi / 4),
         )
         tf_cam = wp.transform(
-            wp.vec3(0.03, 0.0, 0.05),
+            wp.vec3(0.03, 0.0, 0.0587),
             wp.quat_from_axis_angle(wp.vec3(1.0, 0.0, 0.0), math.pi),
         )
         self.camera_offset = wp.transform_multiply(tf_hand, tf_cam)
@@ -311,9 +322,8 @@ class Example:
         # target joint velocities; zero = hold position
         self.target_joint_qd = wp.zeros(n_dofs, dtype=float)
 
-        # finger DOFs are the last two prismatic joints
-        self._finger_dof_0 = n_dofs - 2
-        self._finger_dof_1 = n_dofs - 1
+        # finger DOF is the single prismatic joint (panda_finger_joint1)
+        self._finger_dof = n_dofs - 1
         self.gripper_pos = GRIPPER_MAX  # start fully open
 
         # Jacobian buffers: 6 rows (linear + angular EE velocity) x n_dofs columns
@@ -350,7 +360,7 @@ class Example:
             wp.launch(
                 _compute_ee_body_out,
                 dim=1,
-                inputs=[self._temp_state.body_qd, self.endeffector_id, self.endeffector_offset],
+                inputs=[self._temp_state.body_q, self._temp_state.body_qd, self.endeffector_id, self.endeffector_offset],
                 outputs=[self._body_out],
             )
 
@@ -361,7 +371,7 @@ class Example:
 
         return self._J_flat.numpy().reshape(6, self._n_dofs)
 
-    def apply_ee_delta(self, delta_pos: np.ndarray, delta_rot: np.ndarray):
+    def apply_ee_delta(self, delta_pos: np.ndarray, delta_rot: np.ndarray, dt: float):
         """Map an end-effector delta command to joint velocities.
 
         Uses the pseudoinverse Jacobian to convert desired EE displacement into
@@ -370,6 +380,7 @@ class Example:
         Args:
             delta_pos: Desired EE position displacement this frame [m], shape (3,).
             delta_rot: Desired EE rotation displacement this frame [rad], shape (3,).
+            dt: Actual elapsed wall-clock time since the last step [s].
         """
         ee_delta = np.concatenate([delta_pos, delta_rot]).astype(np.float32)
 
@@ -378,9 +389,9 @@ class Example:
             return
 
         J = self._compute_jacobian(self.state_0)
-        # divide by frame_dt so Featherstone's q += qd * dt integration
-        # produces exactly the desired EE displacement
-        joint_qd = (np.linalg.pinv(J) @ ee_delta / self.frame_dt).astype(np.float32)
+        # Divide by dt so Featherstone's q += qd * sim_dt integration
+        # accumulates exactly the desired EE displacement over the real frame time.
+        joint_qd = (np.linalg.pinv(J) @ ee_delta / dt).astype(np.float32)
         self.target_joint_qd.assign(joint_qd)
 
     def _save_first_cloud(self):
@@ -391,35 +402,42 @@ class Example:
         n_valid = (self._first_cloud_np != 0).any(axis=-1).sum()
         print(f"Saved first point cloud: {self._first_cloud_np.shape}, {n_valid} valid points → {path}")
 
-    def apply_gripper(self, gripper_cmd: float):
+    def apply_gripper(self, gripper_cmd: float, dt: float):
         """Move fingers toward open or closed at a fixed speed.
 
         Args:
             gripper_cmd: 1.0 = close, 0.0 = open.
+            dt: Actual elapsed wall-clock time since the last step [s].
         """
         if gripper_cmd > 0.5:
-            target = max(GRIPPER_MIN, self.gripper_pos - GRIPPER_SPEED * self.frame_dt)
+            target = max(GRIPPER_MIN, self.gripper_pos - GRIPPER_SPEED * dt)
         else:
-            target = min(GRIPPER_MAX, self.gripper_pos + GRIPPER_SPEED * self.frame_dt)
+            target = min(GRIPPER_MAX, self.gripper_pos + GRIPPER_SPEED * dt)
 
-        finger_vel = float((target - self.gripper_pos) / self.frame_dt)
+        finger_vel = float((target - self.gripper_pos) / dt)
         self.gripper_pos = target
 
-        # Override the finger DOFs — these must come after apply_ee_delta so the
-        # pseudoinverse result for those columns is replaced.
+        # Override the finger DOF — must come after apply_ee_delta so the
+        # pseudoinverse result for that column is replaced.
         qd = self.target_joint_qd.numpy()
-        qd[self._finger_dof_0] = finger_vel
-        qd[self._finger_dof_1] = finger_vel
+        qd[self._finger_dof] = finger_vel
         self.target_joint_qd.assign(qd)
 
     def step(self):
+        now = time.monotonic()
+        if self._last_step_time is None:
+            dt = self.frame_dt
+        else:
+            dt = now - self._last_step_time
+        self._last_step_time = now
+
         if self.oculus is not None:
             action = self.oculus.get_action()
             delta_pos, delta_rot, gripper_cmd = action[:3], action[3:6], action[6]
         else:
             delta_pos, delta_rot, gripper_cmd = np.zeros(3), np.zeros(3), 0.0
-        self.apply_ee_delta(delta_pos, delta_rot)
-        self.apply_gripper(gripper_cmd)
+        self.apply_ee_delta(delta_pos, delta_rot, dt)
+        self.apply_gripper(gripper_cmd, dt)
         self.simulate()
         self._sense()
         self.sim_time += self.frame_dt
