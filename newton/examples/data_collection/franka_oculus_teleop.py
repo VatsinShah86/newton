@@ -37,11 +37,11 @@ CAMERA_WIDTH    = 640
 CAMERA_HEIGHT   = 480
 CAMERA_FOV_DEG  = 60.0
 
-ROPE_N_PARTICLES   = 25           # number of particles in the rope chain
-ROPE_LENGTH        = 0.5          # m, total rope length
+ROPE_N_PARTICLES   = 12           # number of particles in the rope chain
+ROPE_LENGTH        = 0.5/2          # m, total rope length
 ROPE_RADIUS        = 0.008        # m, particle collision radius (~8 mm)
 ROPE_PARTICLE_MASS = 2.0e-5       # kg per particle → 5e-4 kg ≈ 0.5 g total
-ROPE_KE            = 2.0e4        # N/m — high stiffness: <0.3 mm stretch at 5 N finger load
+ROPE_KE            = 2.0e6        # N/m — high stiffness: <0.3 mm stretch at 5 N finger load
 ROPE_KD            = 1.0          # N·s/m — near-critical damping for this mass/stiffness
 ROPE_CONTACT_MARGIN = 0.015       # m, particle–body soft contact detection distance
 
@@ -145,7 +145,7 @@ def _compute_rope_segment_xforms(
 
 
 class Example:
-    def __init__(self, viewer, args=None, oculus_ip: str | None = None, debug_replay: str | None = None):
+    def __init__(self, viewer, args=None, oculus_ip: str | None = None, debug_replay: str | None = None, debug_rope: bool = False):
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
         self.sim_substeps = 10
@@ -194,16 +194,16 @@ class Example:
 
         # Particle–body contact: moderate stiffness, low friction so the rope
         # slides freely on the ground but is still grippable by the fingers.
-        self.model.soft_contact_ke = 1.0e4
-        self.model.soft_contact_kd = 1.0e-2
-        self.model.soft_contact_mu = 0.2   # low floor friction; still grippy enough for fingers
+        self.model.soft_contact_ke = 0 #1.0e1
+        self.model.soft_contact_kd = 0 #1.0e-5
+        self.model.soft_contact_mu = 0 #0.4   # low floor friction; still grippy enough for fingers
 
         shape_ke = self.model.shape_material_ke.numpy()
         shape_kd = self.model.shape_material_kd.numpy()
         shape_mu = self.model.shape_material_mu.numpy()
         shape_ke[...] = 5.0e4
-        shape_kd[...] = 1.0e-3
-        shape_mu[...] = 1.0
+        shape_kd[...] = 1.0e-1
+        shape_mu[...] = 1000.0
         self.model.shape_material_ke = wp.array(shape_ke, dtype=self.model.shape_material_ke.dtype, device=self.model.device)
         self.model.shape_material_kd = wp.array(shape_kd, dtype=self.model.shape_material_kd.dtype, device=self.model.device)
         self.model.shape_material_mu = wp.array(shape_mu, dtype=self.model.shape_material_mu.dtype, device=self.model.device)
@@ -272,6 +272,40 @@ class Example:
             self._debug_csv_writer.writeheader()
             atexit.register(self._close_debug_log)
             print(f"Debug replay: {len(self._debug_replay_rows)} frames → {out_path}")
+
+        # Rope force debug logging
+        self._debug_rope_csv_file = None
+        self._debug_rope_csv_writer = None
+        self._debug_rope_frame = 0
+        if debug_rope:
+            # Build shape→body label lookup now, before any state is modified
+            shape_body_np = self.model.shape_body.numpy()
+            body_labels = self.model.body_label  # list[str], one per body
+            self._shape_body_name: list[str] = []
+            for shape_idx in range(len(shape_body_np)):
+                b = int(shape_body_np[shape_idx])
+                if b < 0 or b >= len(body_labels):
+                    self._shape_body_name.append("world/ground")
+                else:
+                    self._shape_body_name.append(body_labels[b])
+
+            out_path = "rope_forces_debug.csv"
+            self._debug_rope_csv_file = open(out_path, "w", newline="")
+            fieldnames = [
+                "frame", "sim_time",
+                "particle_idx",           # 0-indexed within rope
+                "pos_x", "pos_y", "pos_z",
+                "net_force_x", "net_force_y", "net_force_z", "net_force_mag",
+                "n_contacts",             # number of active contacts for this particle
+                "contact_body",           # body applying this contact force (one row per contact)
+                "contact_normal_x", "contact_normal_y", "contact_normal_z",
+            ]
+            self._debug_rope_csv_writer = csv.DictWriter(
+                self._debug_rope_csv_file, fieldnames=fieldnames
+            )
+            self._debug_rope_csv_writer.writeheader()
+            atexit.register(self._close_rope_debug_log)
+            print(f"Rope force debug logging → {out_path}")
 
         # Camera frame visualization buffers
         self._cam_starts = wp.zeros(3, dtype=wp.vec3)
@@ -494,6 +528,8 @@ class Example:
 
         if self._debug_csv_writer is not None:
             self._write_debug_row(delta_pos, delta_rot, gripper_cmd)
+        if self._debug_rope_csv_writer is not None:
+            self._log_rope_forces()
 
     def _write_debug_row(self, delta_pos: np.ndarray, delta_rot: np.ndarray, gripper_cmd: float):
         body_q_np = self.state_0.body_q.numpy()
@@ -550,6 +586,91 @@ class Example:
         if self._debug_csv_file is not None:
             self._debug_csv_file.close()
             self._debug_csv_file = None
+
+    def _close_rope_debug_log(self):
+        if self._debug_rope_csv_file is not None:
+            self._debug_rope_csv_file.close()
+            self._debug_rope_csv_file = None
+
+    def _log_rope_forces(self):
+        """Write one CSV row per (rope particle, contact) for the current frame."""
+        n_contacts_total = int(self.contacts.soft_contact_count.numpy()[0])
+        particle_q_np = self.state_0.particle_q.numpy()
+        particle_f_np = self.state_0.particle_f.numpy()
+
+        # Build per-rope-particle contact lists from the global contact arrays
+        # (contacts may include non-rope particles if any exist, so filter by offset)
+        offset = self._rope_particle_offset
+        n_rope = ROPE_N_PARTICLES
+
+        per_particle_contacts: dict[int, list[tuple[str, np.ndarray]]] = {i: [] for i in range(n_rope)}
+
+        if n_contacts_total > 0:
+            c_particles = self.contacts.soft_contact_particle.numpy()[:n_contacts_total]
+            c_shapes    = self.contacts.soft_contact_shape.numpy()[:n_contacts_total]
+            c_normals   = self.contacts.soft_contact_normal.numpy()[:n_contacts_total]
+            for ci in range(n_contacts_total):
+                global_pidx = int(c_particles[ci])
+                rope_pidx = global_pidx - offset
+                if rope_pidx < 0 or rope_pidx >= n_rope:
+                    continue
+                shape_idx = int(c_shapes[ci])
+                if 0 <= shape_idx < len(self._shape_body_name):
+                    body_name = self._shape_body_name[shape_idx]
+                else:
+                    body_name = "world/ground"
+                per_particle_contacts[rope_pidx].append((body_name, c_normals[ci]))
+
+        for rope_pidx in range(n_rope):
+            global_pidx = offset + rope_pidx
+            pos = particle_q_np[global_pidx]
+            frc = particle_f_np[global_pidx]
+            fmag = float(np.linalg.norm(frc))
+            contacts_for_p = per_particle_contacts[rope_pidx]
+            n_c = len(contacts_for_p)
+
+            if contacts_for_p:
+                for body_name, normal in contacts_for_p:
+                    self._debug_rope_csv_writer.writerow({
+                        "frame": self._debug_rope_frame,
+                        "sim_time": f"{self.sim_time:.6f}",
+                        "particle_idx": rope_pidx,
+                        "pos_x": f"{pos[0]:.6f}",
+                        "pos_y": f"{pos[1]:.6f}",
+                        "pos_z": f"{pos[2]:.6f}",
+                        "net_force_x": f"{frc[0]:.6f}",
+                        "net_force_y": f"{frc[1]:.6f}",
+                        "net_force_z": f"{frc[2]:.6f}",
+                        "net_force_mag": f"{fmag:.6f}",
+                        "n_contacts": n_c,
+                        "contact_body": body_name,
+                        "contact_normal_x": f"{normal[0]:.6f}",
+                        "contact_normal_y": f"{normal[1]:.6f}",
+                        "contact_normal_z": f"{normal[2]:.6f}",
+                    })
+            else:
+                # No contact this frame — still log the particle so every particle
+                # appears every frame, making the CSV easy to pivot on particle_idx.
+                self._debug_rope_csv_writer.writerow({
+                    "frame": self._debug_rope_frame,
+                    "sim_time": f"{self.sim_time:.6f}",
+                    "particle_idx": rope_pidx,
+                    "pos_x": f"{pos[0]:.6f}",
+                    "pos_y": f"{pos[1]:.6f}",
+                    "pos_z": f"{pos[2]:.6f}",
+                    "net_force_x": f"{frc[0]:.6f}",
+                    "net_force_y": f"{frc[1]:.6f}",
+                    "net_force_z": f"{frc[2]:.6f}",
+                    "net_force_mag": f"{fmag:.6f}",
+                    "n_contacts": 0,
+                    "contact_body": "",
+                    "contact_normal_x": "",
+                    "contact_normal_y": "",
+                    "contact_normal_z": "",
+                })
+
+        self._debug_rope_csv_file.flush()
+        self._debug_rope_frame += 1
 
     def _sense(self):
         wp.launch(
@@ -645,7 +766,8 @@ if __name__ == "__main__":
     parser.set_defaults(num_frames=1000)
     parser.add_argument("--oculus-ip", type=str, default=None, help="Quest IP address for teleoperation (omit to run without Oculus)")
     parser.add_argument("--debug-replay", type=str, default=None, metavar="CSV", help="Replay actions from a recorded teleop CSV and write a debug log (e.g. teleop.csv)")
+    parser.add_argument("--debug-rope", action="store_true", default=False, help="Log per-particle rope forces and contact bodies to rope_forces_debug.csv every frame")
     viewer, args = newton.examples.init(parser)
 
-    example = Example(viewer, args, oculus_ip=args.oculus_ip, debug_replay=args.debug_replay)
+    example = Example(viewer, args, oculus_ip=args.oculus_ip, debug_replay=args.debug_replay, debug_rope=args.debug_rope)
     newton.examples.run(example, args)
