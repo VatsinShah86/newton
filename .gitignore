@@ -75,3 +75,4 @@ docs/_static/viser/
 **/*.ipynb_checkpoints/
 
 *.mp4
+*.DS_Store

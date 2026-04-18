@@ -234,9 +234,9 @@
     </collision>
     <!-- box approximation for VBD particle contact (mesh colliders unsupported) -->
     <collision>
-      <origin rpy="0 3.14159265359 -1.57079632679" xyz="-0.00685 0.020 0.0875"/>
+      <origin rpy="0 3.14159265359 -1.57079632679" xyz="0 0.020 0.0875"/>
       <geometry>
-        <box size="0.040 0.040 0.122"/>
+        <box size="0.040 0.03 0.122"/>
       </geometry>
     </collision>
   </link>
@@ -255,9 +255,9 @@
     </collision>
     <!-- box approximation for VBD particle contact (mesh colliders unsupported) -->
     <collision>
-      <origin rpy="0 3.14159265359 1.57079632679" xyz="0.00685 -0.020 0.0875"/>
+      <origin rpy="0 3.14159265359 1.57079632679" xyz="0.0 -0.020 0.0875"/>
       <geometry>
-        <box size="0.040 0.040 0.122"/>
+        <box size="0.040 0.030 0.122"/>
       </geometry>
     </collision>
   </link>
@@ -280,7 +280,7 @@
   <joint name="panda_grip_vis_joint" type="fixed">
     <parent link="panda_hand"/>
     <child link="panda_grip_site"/>
-    <origin rpy="0 0 0" xyz="0 0 0.1025"/>
+    <origin rpy="0 0 0" xyz="0 0 0.208"/>
   </joint>
   <link name="panda_grip_site">
     <visual>
