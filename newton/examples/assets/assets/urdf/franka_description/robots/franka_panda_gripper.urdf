@@ -232,6 +232,13 @@
         <mesh filename="../../../umi/soft_gripper_finger.stl"/>
       </geometry>
     </collision>
+    <!-- box approximation for VBD particle contact (mesh colliders unsupported) -->
+    <collision>
+      <origin rpy="0 3.14159265359 -1.57079632679" xyz="-0.00685 0.020 0.0875"/>
+      <geometry>
+        <box size="0.040 0.040 0.122"/>
+      </geometry>
+    </collision>
   </link>
   <link name="panda_rightfinger">
     <visual>
@@ -246,6 +253,13 @@
         <mesh filename="../../../umi/soft_gripper_finger.stl"/>
       </geometry>
     </collision>
+    <!-- box approximation for VBD particle contact (mesh colliders unsupported) -->
+    <collision>
+      <origin rpy="0 3.14159265359 1.57079632679" xyz="0.00685 -0.020 0.0875"/>
+      <geometry>
+        <box size="0.040 0.040 0.122"/>
+      </geometry>
+    </collision>
   </link>
   <joint name="panda_finger_joint1" type="prismatic">
     <parent link="panda_hand"/>
@@ -255,10 +269,13 @@
     <dynamics damping="10.0"/>
     <limit effort="20" lower="0.0" upper="0.04" velocity="0.2"/>
   </joint>
-  <joint name="panda_finger_joint2" type="fixed">
+  <joint name="panda_finger_joint2" type="prismatic">
     <parent link="panda_hand"/>
     <child link="panda_rightfinger"/>
     <origin rpy="0 0 0" xyz="0 0 0.0584"/>
+    <axis xyz="0 -1 0"/>
+    <dynamics damping="10.0"/>
+    <limit effort="20" lower="0.0" upper="0.04" velocity="0.2"/>
   </joint>
   <joint name="panda_grip_vis_joint" type="fixed">
     <parent link="panda_hand"/>

@@ -41,13 +41,15 @@ class PatchedOculusReader(OculusReader):
 
 
 class QuestStream:
-    def __init__(self, ip: str, pose_scaler=(1.0, 0.85), channel_signs=(1,1,1, -1,-1,-1)):
+    def __init__(self, ip: str, pose_scaler=(0.25, 0.85), channel_signs=(1,1,1, 1,-1,1)):
         self.reader = PatchedOculusReader(ip_address=ip)
         self.pos_scale = pose_scaler[0]
         self.rot_scale = pose_scaler[1]
         self.signs = np.array(channel_signs)
         self._prev_pos = None
         self._prev_rot = None
+        self._gripper_open = True   # toggle state: True = open, False = closed
+        self._prev_A = 0            # previous value of button A for edge detection
 
     def get_action(self):
         transforms, buttons = self.reader.get_transformations_and_buttons()
@@ -59,12 +61,18 @@ class QuestStream:
         rot = Rotation.from_matrix(T[:3, :3])
 
         enabled = buttons.get('rightGrip', (0,))[0] > 0.5
-        gripper  = float(buttons.get('rightTrig', (0,))[0] > 0.5)
+
+        # Toggle gripper on rising edge of button A (0 → 1)
+        curr_A = int(buttons.get('A', (0,)))
+        if curr_A == 1 and self._prev_A == 0:
+            self._gripper_open = not self._gripper_open
+        self._prev_A = curr_A
+        gripper = 0.0 if self._gripper_open else 1.0
 
         if self._prev_pos is None or not enabled:
             self._prev_pos = pos.copy()
             self._prev_rot = rot
-            return np.zeros(7)
+            return np.array([0., 0., 0., 0., 0., 0., gripper])
 
         oculus_delta_pos = (pos - self._prev_pos) * self.pos_scale
         oculus_delta_rotvec = (self._prev_rot.inv() * rot).as_rotvec() * self.rot_scale
