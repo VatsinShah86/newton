@@ -20,6 +20,7 @@ import os
 
 import numpy as np
 import warp as wp
+import zarr
 from pxr import Usd
 
 import newton
@@ -40,9 +41,17 @@ CAMERA_WIDTH    = 640
 CAMERA_HEIGHT   = 480
 CAMERA_FOV_DEG  = 60.0
 
+# Point cloud subsampling: sample a 32×32 uniform grid from the full 640×480 depth
+# image → exactly 1024 points while preserving the full 4:3 field of view.
+PC_COLS     = 32
+PC_ROWS     = 32
+PC_STRIDE_X = CAMERA_WIDTH  // PC_COLS   # 20
+PC_STRIDE_Y = CAMERA_HEIGHT // PC_ROWS   # 15
+PC_N_POINTS = PC_COLS * PC_ROWS          # 1024
+
 # Shirt mesh (unisex_shirt.usd) is stored in centimetres; scale=0.01 converts to metres.
-SHIRT_MESH_SCALE         = 0.01
-SHIRT_POS                = wp.vec3(0.0, -0.2, 0.05)   # m, above ground in robot workspace
+SHIRT_MESH_SCALE         = 0.006
+SHIRT_POS                = wp.vec3(0.05, 0.2, 0.0025)   # m, above ground in robot workspace
 SHIRT_ROT                = wp.quat_from_axis_angle(wp.vec3(0.0, 0.0, 1.0), math.pi)
 SHIRT_DENSITY            = 0.02    # kg/m²
 SHIRT_PARTICLE_RADIUS    = 0.008   # m, cloth collision radius
@@ -54,6 +63,9 @@ SHIRT_TRI_KA             = 1.0e3   # N/m, area preservation stiffness
 SHIRT_TRI_KD             = 1.0e-6  # damping
 SHIRT_BENDING_KE         = 0.1     # N·m/rad, bending stiffness
 SHIRT_BENDING_KD         = 1.0e-4  # N·m·s/rad, bending damping
+
+# Default zarr dataset path (created when --record is passed)
+DATASET_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "data", "teleop_dataset.zarr")
 
 # IK iterations per step
 IK_ITERS = 24
@@ -109,20 +121,31 @@ def _depth_to_point_cloud(
     depth: wp.array(dtype=wp.float32, ndim=4),    # (worlds, cameras, H, W)
     rays: wp.array(dtype=wp.vec3f, ndim=4),        # (cameras, H, W, 2) — [..,0]=origin [..,1]=dir
     cam_tf: wp.array(dtype=wp.transformf, ndim=2), # (cameras, worlds)
-    out: wp.array(dtype=wp.vec3f, ndim=2),         # (H, W) — zero vec = no hit
+    stride_y: int,
+    stride_x: int,
+    n_cols: int,
+    out: wp.array(dtype=wp.vec3f),                 # flat (PC_N_POINTS,) — zero vec = no hit
 ):
-    y, x = wp.tid()
-    d = depth[0, 0, y, x]
+    """Sample one depth pixel per thread at a uniform stride and unproject to world space.
+
+    Launch with dim=(PC_ROWS, PC_COLS) so every thread maps to one of the 1024 output
+    points while still reading from the full-resolution depth image.
+    """
+    row, col = wp.tid()
+    src_y = row * stride_y
+    src_x = col * stride_x
+    d = depth[0, 0, src_y, src_x]
+    idx = row * n_cols + col
     if d <= 0.0:
-        out[y, x] = wp.vec3f(0.0, 0.0, 0.0)
+        out[idx] = wp.vec3f(0.0, 0.0, 0.0)
         return
     tf = cam_tf[0, 0]
-    ray_dir_world = wp.transform_vector(tf, rays[0, y, x, 1])
-    out[y, x] = wp.transform_get_translation(tf) + d * ray_dir_world
+    ray_dir_world = wp.transform_vector(tf, rays[0, src_y, src_x, 1])
+    out[idx] = wp.transform_get_translation(tf) + d * ray_dir_world
 
 
 class Example:
-    def __init__(self, viewer, args=None, oculus_ip: str | None = None, debug_replay: str | None = None, debug_rope: bool = False):
+    def __init__(self, viewer, args=None, oculus_ip: str | None = None, debug_replay: str | None = None, debug_rope: bool = False, record: bool = False):
         self.fps = 60
         self.frame_dt = 1.0 / self.fps
         self.sim_substeps = 10
@@ -318,9 +341,18 @@ class Example:
         self._cam_depth = self.camera_sensor.create_depth_image_output(
             CAMERA_WIDTH, CAMERA_HEIGHT, camera_count=1
         )
-        self.cam_point_cloud = wp.zeros((CAMERA_HEIGHT, CAMERA_WIDTH), dtype=wp.vec3f)
-        self._first_cloud_np = None
-        atexit.register(self._save_first_cloud)
+        self._cam_color = self.camera_sensor.create_color_image_output(
+            CAMERA_WIDTH, CAMERA_HEIGHT, camera_count=1
+        )
+        self.cam_point_cloud = wp.zeros(PC_N_POINTS, dtype=wp.vec3f)
+
+        # Dataset recording (activated by --record flag)
+        self._record = record
+        self._record_actions: list[np.ndarray] = []
+        self._record_states: list[np.ndarray] = []
+        self._record_clouds: list[np.ndarray] = []
+        if record:
+            atexit.register(self._save_dataset)
 
         self.viewer.set_model(self.model)
         self.viewer.set_camera(wp.vec3(-0.6, 0.6, 1.24), -42.0, -58.0)
@@ -473,13 +505,48 @@ class Example:
         tq[self._finger_dof2] = self.gripper_pos
         self.target_joint_q.assign(tq)
 
-    def _save_first_cloud(self):
-        if self._first_cloud_np is None:
+    @staticmethod
+    def _quat_to_euler(q: np.ndarray) -> np.ndarray:
+        """Convert quaternion [qx, qy, qz, qw] to ZYX Euler angles [roll, pitch, yaw] in radians."""
+        qx, qy, qz, qw = float(q[0]), float(q[1]), float(q[2]), float(q[3])
+        roll  = math.atan2(2.0 * (qw * qx + qy * qz), 1.0 - 2.0 * (qx * qx + qy * qy))
+        pitch = math.asin(max(-1.0, min(1.0, 2.0 * (qw * qy - qz * qx))))
+        yaw   = math.atan2(2.0 * (qw * qz + qx * qy), 1.0 - 2.0 * (qy * qy + qz * qz))
+        return np.array([roll, pitch, yaw], dtype=np.float32)
+
+    def _save_dataset(self):
+        """Flush recorded frames to DATASET_PATH zarr store (appends across multiple runs)."""
+        n = len(self._record_actions)
+        if n == 0:
             return
-        path = "first_point_cloud.npy"
-        np.save(path, self._first_cloud_np)
-        n_valid = (self._first_cloud_np != 0).any(axis=-1).sum()
-        print(f"Saved first point cloud: {self._first_cloud_np.shape}, {n_valid} valid points → {path}")
+
+        actions = np.stack(self._record_actions)   # (N, 7)
+        states  = np.stack(self._record_states)    # (N, 7)
+        clouds  = np.stack(self._record_clouds)    # (N, 1024, 6)
+
+        os.makedirs(os.path.dirname(DATASET_PATH), exist_ok=True)
+        store = zarr.open_group(DATASET_PATH, mode="a")
+        compressor = zarr.Blosc(cname="zstd", clevel=3, shuffle=1)
+
+        if "data" not in store:
+            data_grp = store.create_group("data")
+            meta_grp = store.create_group("meta")
+            data_grp.create_dataset("action",      data=actions, chunks=(100, 7),       dtype="float32", compressor=compressor)
+            data_grp.create_dataset("state",       data=states,  chunks=(100, 7),       dtype="float32", compressor=compressor)
+            data_grp.create_dataset("point_cloud", data=clouds,  chunks=(100, 1024, 6), dtype="float32", compressor=compressor)
+            meta_grp.create_dataset("episode_ends", data=np.array([n], dtype=np.int64), chunks=(100,),   compressor=compressor)
+        else:
+            data_grp = store["data"]
+            meta_grp = store["meta"]
+            prev_end = int(meta_grp["episode_ends"][-1])
+            data_grp["action"].append(actions)
+            data_grp["state"].append(states)
+            data_grp["point_cloud"].append(clouds)
+            meta_grp["episode_ends"].append(np.array([prev_end + n], dtype=np.int64))
+
+        total = int(store["meta"]["episode_ends"][-1])
+        n_episodes = len(store["meta"]["episode_ends"])
+        print(f"Saved {n} frames → {DATASET_PATH}  ({n_episodes} episode(s), {total} frames total)")
 
     def step(self):
         if self._debug_replay_rows:
@@ -500,8 +567,18 @@ class Example:
         self.apply_ee_delta(delta_pos, delta_rot)
         self.apply_gripper(gripper_cmd)
         self.simulate()
-        self._sense()
+        self._sense()  # appends point cloud to _record_clouds when recording
         self.sim_time += self.frame_dt
+
+        if self._record:
+            action_np = np.concatenate([delta_pos, delta_rot, [gripper_cmd]]).astype(np.float32)
+            self._record_actions.append(action_np)
+
+            body_q_np = self.state_0.body_q.numpy()
+            ee_tf = body_q_np[self.endeffector_id]
+            ee_euler = self._quat_to_euler(ee_tf[3:7])
+            state_np = np.concatenate([ee_tf[:3], ee_euler, [self.gripper_pos]]).astype(np.float32)
+            self._record_states.append(state_np)
 
         if self._debug_csv_writer is not None:
             self._write_debug_row(delta_pos, delta_rot, gripper_cmd)
@@ -659,17 +736,26 @@ class Example:
             self.state_0,
             self._cam_tf,
             self._cam_rays,
-            color_image=None,
+            color_image=self._cam_color,
             depth_image=self._cam_depth,
         )
         wp.launch(
             _depth_to_point_cloud,
-            dim=(CAMERA_HEIGHT, CAMERA_WIDTH),
-            inputs=[self._cam_depth, self._cam_rays, self._cam_tf],
+            dim=(PC_ROWS, PC_COLS),
+            inputs=[self._cam_depth, self._cam_rays, self._cam_tf, PC_STRIDE_Y, PC_STRIDE_X, PC_COLS],
             outputs=[self.cam_point_cloud],
         )
-        if self._first_cloud_np is None:
-            self._first_cloud_np = self.cam_point_cloud.numpy().copy()
+        if self._record:
+            xyz_np = self.cam_point_cloud.numpy()                    # (1024, 3) float32
+            color_raw = self._cam_color.numpy()[0, 0]                # (H, W) uint32, packed RGBA
+            rows_idx = np.arange(PC_ROWS, dtype=np.int32) * PC_STRIDE_Y
+            cols_idx = np.arange(PC_COLS, dtype=np.int32) * PC_STRIDE_X
+            sampled = color_raw[np.ix_(rows_idx, cols_idx)].reshape(PC_N_POINTS)  # (1024,) uint32
+            r = (sampled & 0xFF).astype(np.float32) / 255.0
+            g = ((sampled >> 8) & 0xFF).astype(np.float32) / 255.0
+            b = ((sampled >> 16) & 0xFF).astype(np.float32) / 255.0
+            rgb_np = np.stack([r, g, b], axis=-1)                    # (1024, 3) float32
+            self._record_clouds.append(np.concatenate([xyz_np, rgb_np], axis=-1))  # (1024, 6)
 
     def simulate(self):
         # Compute joint velocities once per frame so the robot reaches the IK target
@@ -738,7 +824,8 @@ if __name__ == "__main__":
     parser.add_argument("--oculus-ip", type=str, default=None, help="Quest IP address for teleoperation (omit to run without Oculus)")
     parser.add_argument("--debug-replay", type=str, default=None, metavar="CSV", help="Replay actions from a recorded teleop CSV and write a debug log (e.g. teleop.csv)")
     parser.add_argument("--debug-cloth", action="store_true", default=False, help="Log per-particle cloth forces and contact bodies to rope_forces_debug.csv every frame")
+    parser.add_argument("--record", action="store_true", default=False, help=f"Record teleoperation dataset to {DATASET_PATH} (appends across runs)")
     viewer, args = newton.examples.init(parser)
 
-    example = Example(viewer, args, oculus_ip=args.oculus_ip, debug_replay=args.debug_replay, debug_rope=args.debug_cloth)
+    example = Example(viewer, args, oculus_ip=args.oculus_ip, debug_replay=args.debug_replay, debug_rope=args.debug_cloth, record=args.record)
     newton.examples.run(example, args)
