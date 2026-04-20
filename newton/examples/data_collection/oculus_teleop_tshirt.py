@@ -61,7 +61,7 @@ SHIRT_SELF_CONTACT_MARGIN = 0.002  # m
 SHIRT_TRI_KE             = 1.0e3   # N/m, in-plane stretch stiffness
 SHIRT_TRI_KA             = 1.0e3   # N/m, area preservation stiffness
 SHIRT_TRI_KD             = 1.0e-6  # damping
-SHIRT_BENDING_KE         = 0.1     # N·m/rad, bending stiffness
+SHIRT_BENDING_KE         = 0.01     # N·m/rad, bending stiffness
 SHIRT_BENDING_KD         = 1.0e-4  # N·m·s/rad, bending damping
 
 # Default zarr dataset path (created when --record is passed)
@@ -351,8 +351,7 @@ class Example:
         self._record_actions: list[np.ndarray] = []
         self._record_states: list[np.ndarray] = []
         self._record_clouds: list[np.ndarray] = []
-        if record:
-            atexit.register(self._save_dataset)
+        pass  # dataset saving is handled interactively on exit
 
         self.viewer.set_model(self.model)
         self.viewer.set_camera(wp.vec3(-0.6, 0.6, 1.24), -42.0, -58.0)
@@ -829,3 +828,13 @@ if __name__ == "__main__":
 
     example = Example(viewer, args, oculus_ip=args.oculus_ip, debug_replay=args.debug_replay, debug_rope=args.debug_cloth, record=args.record)
     newton.examples.run(example, args)
+
+    if args.record and example._record_actions:
+        try:
+            answer = input(f"\nSave {len(example._record_actions)} recorded frames to dataset? [y/N] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            answer = ""
+        if answer in ("y", "yes"):
+            example._save_dataset()
+        else:
+            print("Discarding recording.")
