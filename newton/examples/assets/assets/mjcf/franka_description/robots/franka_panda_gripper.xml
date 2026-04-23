@@ -1,0 +1,178 @@
+<mujoco model="franka_panda_gripper">
+  <compiler angle="radian" autolimits="true" inertiafromgeom="true"/>
+
+  <default>
+    <default class="visual">
+      <geom type="mesh" contype="0" conaffinity="0" density="0" group="1" rgba="0.75 0.75 0.75 1"/>
+    </default>
+    <default class="collision">
+      <geom group="3" rgba="0 0 0 0"/>
+    </default>
+  </default>
+
+  <asset>
+    <mesh name="link0_visual" file="../meshes/visual/link0.obj"/>
+    <mesh name="link1_visual" file="../meshes/visual/link1.obj"/>
+    <mesh name="link2_visual" file="../meshes/visual/link2.obj"/>
+    <mesh name="link3_visual" file="../meshes/visual/link3.obj"/>
+    <mesh name="link4_visual" file="../meshes/visual/link4.obj"/>
+    <mesh name="link5_visual" file="../meshes/visual/link5.obj"/>
+    <mesh name="link6_visual" file="../meshes/visual/link6.obj"/>
+    <mesh name="link7_visual" file="../meshes/visual/link7.obj"/>
+    <mesh name="hand_visual" file="../meshes/visual/hand.obj"/>
+
+    <mesh name="link0_collision" file="../../../urdf/franka_description/meshes/collision/link0.obj"/>
+    <mesh name="link1_collision" file="../../../urdf/franka_description/meshes/collision/link1.obj"/>
+    <mesh name="link2_collision" file="../../../urdf/franka_description/meshes/collision/link2.obj"/>
+    <mesh name="link3_collision" file="../../../urdf/franka_description/meshes/collision/link3.obj"/>
+    <mesh name="link4_collision" file="../../../urdf/franka_description/meshes/collision/link4.obj"/>
+    <mesh name="link5_collision" file="../../../urdf/franka_description/meshes/collision/link5.obj"/>
+    <mesh name="link6_collision" file="../../../urdf/franka_description/meshes/collision/link6.obj"/>
+    <mesh name="link7_collision" file="../../../urdf/franka_description/meshes/collision/link7.obj"/>
+    <mesh name="hand_collision" file="../../../urdf/franka_description/meshes/collision/hand.obj"/>
+    <mesh name="soft_gripper_finger" file="../../../umi/soft_gripper_finger.stl"/>
+  </asset>
+
+  <worldbody>
+    <body name="panda_link0">
+      <geom name="panda_link0_visual" class="visual" mesh="link0_visual"/>
+      <geom name="panda_link0_collision" class="collision" mesh="link0_collision"/>
+
+      <body name="panda_link1" pos="0 0 0.333">
+        <joint name="panda_joint1" axis="0 0 1" range="-2.8973 2.8973" actuatorfrcrange="-87 87" damping="10"/>
+        <geom name="panda_link1_visual" class="visual" mesh="link1_visual"/>
+        <geom name="panda_link1_collision" class="collision" mesh="link1_collision"/>
+
+        <body name="panda_link2" quat="0.707107 -0.707107 0 0">
+          <joint name="panda_joint2" axis="0 0 1" range="-1.7628 1.7628" actuatorfrcrange="-87 87" damping="10"/>
+          <geom name="panda_link2_visual" class="visual" mesh="link2_visual"/>
+          <geom name="panda_link2_collision" class="collision" mesh="link2_collision"/>
+
+          <body name="panda_link3" pos="0 -0.316 0" quat="0.707107 0.707107 0 0">
+            <joint name="panda_joint3" axis="0 0 1" range="-2.8973 2.8973" actuatorfrcrange="-87 87" damping="10"/>
+            <geom name="panda_link3_visual" class="visual" mesh="link3_visual"/>
+            <geom name="panda_link3_collision" class="collision" mesh="link3_collision"/>
+
+            <body name="panda_link4" pos="0.0825 0 0" quat="0.707107 0.707107 0 0">
+              <joint name="panda_joint4" axis="0 0 1" range="-3.0718 -0.0698" actuatorfrcrange="-87 87" damping="10"/>
+              <geom name="panda_link4_visual" class="visual" mesh="link4_visual"/>
+              <geom name="panda_link4_collision" class="collision" mesh="link4_collision"/>
+
+              <body name="panda_link5" pos="-0.0825 0.384 0" quat="0.707107 -0.707107 0 0">
+                <joint name="panda_joint5" axis="0 0 1" range="-2.8973 2.8973" actuatorfrcrange="-12 12" damping="10"/>
+                <geom name="panda_link5_visual" class="visual" mesh="link5_visual"/>
+                <geom name="panda_link5_collision" class="collision" mesh="link5_collision"/>
+
+                <body name="panda_link6" quat="0.707107 0.707107 0 0">
+                  <joint name="panda_joint6" axis="0 0 1" range="-0.0175 3.7525" actuatorfrcrange="-12 12" damping="10"/>
+                  <geom name="panda_link6_visual" class="visual" mesh="link6_visual"/>
+                  <geom name="panda_link6_collision" class="collision" mesh="link6_collision"/>
+
+                  <body name="panda_link7" pos="0.088 0 0" quat="0.707107 0.707107 0 0">
+                    <joint name="panda_joint7" axis="0 0 1" range="-2.8973 2.8973" actuatorfrcrange="-12 12" damping="10"/>
+                    <geom name="panda_link7_visual" class="visual" mesh="link7_visual"/>
+                    <geom name="panda_link7_collision" class="collision" mesh="link7_collision"/>
+
+                    <body name="panda_hand" pos="0 0 0.107" quat="0.92388 0 0 -0.382683">
+                      <geom name="panda_hand_visual" class="visual" mesh="hand_visual"/>
+                      <geom name="panda_hand_collision" class="collision" mesh="hand_collision"/>
+
+                      <body name="panda_hand_y_axis" pos="0 0.01 0"/>
+                      <body name="panda_hand_z_axis" pos="0 0 0.01"/>
+                      <body name="camera_link" pos="0.03 0 0.0587" quat="0 1 0 0"/>
+                      <site name="panda_grip_site" pos="0 0 0.208" size="0.0001" rgba="0 0 0 0"/>
+
+                      <body name="panda_leftfinger" pos="0 0 0.0584">
+                        <joint
+                          name="panda_finger_joint1"
+                          type="slide"
+                          axis="0 1 0"
+                          range="0 0.04"
+                          actuatorfrcrange="-20 20"
+                          damping="10"
+                        />
+                        <geom
+                          name="panda_leftfinger_visual"
+                          class="visual"
+                          mesh="soft_gripper_finger"
+                          pos="0.01315 0 0.0265"
+                          quat="0 0.707107 0.707107 0"
+                        />
+                        <geom
+                          name="panda_leftfinger_collision"
+                          class="collision"
+                          mesh="soft_gripper_finger"
+                          pos="0.01315 0 0.0265"
+                          quat="0 0.707107 0.707107 0"
+                        />
+                        <geom
+                          name="panda_leftfinger_pad_collision"
+                          class="collision"
+                          type="box"
+                          size="0.02 0.015 0.061"
+                          pos="0 0.02 0.0875"
+                          quat="0 0.707107 0.707107 0"
+                        />
+
+                        <body name="panda_leftfinger_tip" pos="0 0.0015 0.0441">
+                          <geom
+                            name="panda_leftfinger_tip_collision"
+                            class="collision"
+                            type="box"
+                            size="0.0065 0.002 0.0065"
+                          />
+                        </body>
+                      </body>
+
+                      <body name="panda_rightfinger" pos="0 0 0.0584">
+                        <joint
+                          name="panda_finger_joint2"
+                          type="slide"
+                          axis="0 -1 0"
+                          range="0 0.04"
+                          actuatorfrcrange="-20 20"
+                          damping="10"
+                        />
+                        <geom
+                          name="panda_rightfinger_visual"
+                          class="visual"
+                          mesh="soft_gripper_finger"
+                          pos="-0.01315 0 0.0265"
+                          quat="0 -0.707107 0.707107 0"
+                        />
+                        <geom
+                          name="panda_rightfinger_collision"
+                          class="collision"
+                          mesh="soft_gripper_finger"
+                          pos="-0.01315 0 0.0265"
+                          quat="0 -0.707107 0.707107 0"
+                        />
+                        <geom
+                          name="panda_rightfinger_pad_collision"
+                          class="collision"
+                          type="box"
+                          size="0.02 0.015 0.061"
+                          pos="0 -0.02 0.0875"
+                          quat="0 -0.707107 0.707107 0"
+                        />
+
+                        <body name="panda_rightfinger_tip" pos="0 -0.0015 0.0441">
+                          <geom
+                            name="panda_rightfinger_tip_collision"
+                            class="collision"
+                            type="box"
+                            size="0.0065 0.002 0.0065"
+                          />
+                        </body>
+                      </body>
+                    </body>
+                  </body>
+                </body>
+              </body>
+            </body>
+          </body>
+        </body>
+      </body>
+    </body>
+  </worldbody>
+</mujoco>
