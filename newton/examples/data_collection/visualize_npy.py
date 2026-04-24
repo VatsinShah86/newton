@@ -42,6 +42,19 @@ def _set_equal_aspect_2d(ax, x_values, y_values):
     ax.set_ylim(y_center - radius, y_center + radius)
     ax.set_aspect("equal", adjustable="box")
 
+
+def _set_equal_aspect_3d(ax, xyz):
+    mins = np.min(xyz, axis=0)
+    maxs = np.max(xyz, axis=0)
+    center = 0.5 * (mins + maxs)
+    radius = 0.5 * max(np.max(maxs - mins), 1e-6)
+
+    ax.set_xlim(center[0] - radius, center[0] + radius)
+    ax.set_ylim(center[1] - radius, center[1] + radius)
+    ax.set_zlim(center[2] - radius, center[2] + radius)
+    if hasattr(ax, "set_box_aspect"):
+        ax.set_box_aspect((1, 1, 1))
+
 def visualize_seg(file_path):
     """Visualizes a segmentation .npy file."""
     try:
@@ -75,11 +88,12 @@ def visualize_depth(file_path):
         print(f"Error loading or visualizing {file_path}: {e}")
 
 
-def visualize_pc(file_path):
+def visualize_pc(file_path, png_path=None, show=True):
     """Visualizes a point cloud .npy file.
 
-    Accepts either shape (N, 3) or (H, W, 3). Zero vectors are treated as
-    invalid pixels and filtered out before plotting.
+    Accepts either shape (N, 3), (N, 6), (H, W, 3), or (H, W, 6).
+    Zero vectors are treated as invalid pixels and filtered out before plotting.
+    If RGB columns are present they are expected in [0, 1] or [0, 255].
     """
     try:
         data = np.load(file_path)
@@ -87,17 +101,24 @@ def visualize_pc(file_path):
         print(f"Data shape: {data.shape}")
         print(f"Data type: {data.dtype}")
 
-        # Normalise to (N, 3)
-        if data.ndim == 3 and data.shape[2] == 3:
-            data = data.reshape(-1, 3)
-        if data.ndim != 2 or data.shape[1] != 3:
-            raise ValueError(f"Expected point cloud shape (N, 3) or (H, W, 3), got {data.shape}")
+        if data.ndim == 3 and data.shape[2] in (3, 6):
+            data = data.reshape(-1, data.shape[2])
+        if data.ndim != 2 or data.shape[1] not in (3, 6):
+            raise ValueError(f"Expected point cloud shape (N, 3), (N, 6), (H, W, 3), or (H, W, 6), got {data.shape}")
 
-        # Remove invalid (zero) points
-        valid = (data != 0).any(axis=1)
-        data = data[valid]
-        print(f"Valid points: {data.shape[0]}")
-        if data.shape[0] == 0:
+        xyz = data[:, :3]
+        rgb = data[:, 3:6] if data.shape[1] == 6 else None
+
+        valid = (xyz != 0).any(axis=1)
+        xyz = xyz[valid]
+        if rgb is not None:
+            rgb = rgb[valid].astype(np.float32, copy=False)
+            if rgb.size > 0 and float(np.max(rgb)) > 1.0:
+                rgb = rgb / 255.0
+            rgb = np.clip(rgb, 0.0, 1.0)
+
+        print(f"Valid points: {xyz.shape[0]}")
+        if xyz.shape[0] == 0:
             print("No valid points to display.")
             return
 
@@ -114,9 +135,9 @@ def visualize_pc(file_path):
                 (1, 2, "Y", "Z"),
             ]
             for ax, (x_idx, y_idx, x_label, y_label) in zip(axes, projections, strict=True):
-                x_values = data[:, x_idx]
-                y_values = data[:, y_idx]
-                ax.scatter(x_values, y_values, s=1)
+                x_values = xyz[:, x_idx]
+                y_values = xyz[:, y_idx]
+                ax.scatter(x_values, y_values, s=1, c=rgb if rgb is not None else None)
                 ax.set_xlabel(x_label)
                 ax.set_ylabel(y_label)
                 ax.set_title(f"{x_label}{y_label} Projection")
@@ -124,20 +145,33 @@ def visualize_pc(file_path):
 
             fig.suptitle(f"Point Cloud Projections: {os.path.basename(file_path)}")
             plt.tight_layout()
-            plt.show()
+            if png_path is not None:
+                plt.savefig(png_path, dpi=200, bbox_inches="tight")
+                print(f"Saved point cloud plot to {png_path}")
+            if show:
+                plt.show()
+            else:
+                plt.close(fig)
             return
 
         fig = plt.figure()
         ax = fig.add_subplot(111, projection="3d")
 
-        ax.scatter(data[:, 0], data[:, 1], data[:, 2], s=1)
+        ax.scatter(xyz[:, 0], xyz[:, 1], xyz[:, 2], s=1, c=rgb if rgb is not None else None)
 
         ax.set_xlabel("X")
         ax.set_ylabel("Y")
         ax.set_zlabel("Z")
         ax.set_title(f"Point Cloud: {os.path.basename(file_path)}")
+        _set_equal_aspect_3d(ax, xyz)
 
-        plt.show()
+        if png_path is not None:
+            plt.savefig(png_path, dpi=200, bbox_inches="tight")
+            print(f"Saved point cloud plot to {png_path}")
+        if show:
+            plt.show()
+        else:
+            plt.close(fig)
     except Exception as e:
         print(f"Error loading or visualizing {file_path}: {e}")
 
@@ -158,6 +192,17 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Visualize .npy files (segmentation, depth, point cloud, or actions).")
     parser.add_argument("path", type=str, help="Path to a .npy file, or a folder name (legacy: requires file_number too).")
     parser.add_argument("file_number", type=int, nargs="?", help="File number for the legacy folder/number addressing scheme.")
+    parser.add_argument(
+        "--png-path",
+        type=str,
+        default=None,
+        help="Optional path to save the point cloud plot as a PNG. If omitted, the plot is only shown.",
+    )
+    parser.add_argument(
+        "--no-show",
+        action="store_true",
+        help="Do not open an interactive matplotlib window. Useful when saving a PNG in headless environments.",
+    )
 
     args = parser.parse_args()
 
@@ -168,5 +213,5 @@ if __name__ == "__main__":
             parser.error("file_number is required when using the legacy folder/number scheme.")
         file_path = _resolve_point_cloud_path(args.path, args.file_number)
 
-    visualize_pc(file_path)
+    visualize_pc(file_path, png_path=args.png_path, show=not args.no_show)
     
