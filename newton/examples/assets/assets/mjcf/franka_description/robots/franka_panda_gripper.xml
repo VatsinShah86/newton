@@ -124,8 +124,8 @@
                           name="panda_leftfinger_collision"
                           class="collision"
                           type="box"
-                          size="0.008 0.006 0.03"
-                          pos="0.01315 0 0.0265"
+                          size="0.02 0.015 0.061"
+                          pos="0 0.02 0.0875"
                           quat="0 0.707107 0.707107 0"
                         />
                       </body>
@@ -160,8 +160,8 @@
                           name="panda_rightfinger_collision"
                           class="collision"
                           type="box"
-                          size="0.008 0.006 0.03"
-                          pos="-0.01315 0 0.0265"
+                          size="0.02 0.015 0.061"
+                          pos="0 -0.02 0.0875"
                           quat="0 -0.707107 0.707107 0"
                         />
                       </body>
