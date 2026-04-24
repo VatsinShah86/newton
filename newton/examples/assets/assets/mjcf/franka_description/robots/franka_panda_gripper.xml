@@ -100,7 +100,7 @@
                           type="slide"
                           axis="0 1 0"
                           range="0 0.04"
-                          actuatorfrcrange="-20 20"
+                          actuatorfrcrange="-60 60"
                           damping="10"
                         />
                         <geom
@@ -127,7 +127,8 @@
                           size="0.02 0.015 0.061"
                           pos="0 0.02 0.0875"
                           quat="0 0.707107 0.707107 0"
-                          friction="2.0 0.02 0.01"
+                          condim="6"
+                          friction="4.0 0.05 0.02"
                         />
                       </body>
 
@@ -137,7 +138,7 @@
                           type="slide"
                           axis="0 -1 0"
                           range="0 0.04"
-                          actuatorfrcrange="-20 20"
+                          actuatorfrcrange="-60 60"
                           damping="10"
                         />
                         <geom
@@ -164,7 +165,8 @@
                           size="0.02 0.015 0.061"
                           pos="0 -0.02 0.0875"
                           quat="0 -0.707107 0.707107 0"
-                          friction="2.0 0.02 0.01"
+                          condim="6"
+                          friction="4.0 0.05 0.02"
                         />
                       </body>
                     </body>
