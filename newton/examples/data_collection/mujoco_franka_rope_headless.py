@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import os
 import shutil
 import subprocess
@@ -44,7 +45,7 @@ else:
     import mujoco.osmesa as mujoco_gl
 
 
-GRIPPER_SPEED = 0.08
+GRIPPER_SPEED = 0.02
 GRIPPER_MAX = 0.04
 CAMERA_FOV_DEG = 60.0
 PC_ROWS = 32
@@ -55,11 +56,15 @@ LIFT_HEIGHT = 0.10
 EE_POS_DELTA_PER_STEP = 0.003
 POSE_REACHED_TOL = 0.006
 GRIP_REACHED_TOL = 0.004
+GRIP_HOLD_FRAMES = 45
 STEP_TARGET_GAIN = 0.35
 IK_POS_WEIGHT = 5.0
 IK_ROT_WEIGHT = 4.0
 IK_REG_WEIGHT = 0.02
 KINEMATIC_QSTEP_PER_SUBSTEP = 0.01
+FINGER_ACTUATOR_KP = 220.0
+FINGER_ACTUATOR_KV = 24.0
+FINGER_FORCE_LIMIT = 20.0
 
 ROPE_N_PARTICLES = 12
 ROPE_LENGTH = 0.5 / 2.0
@@ -180,19 +185,25 @@ class Example:
             [self.model.jnt_qposadr[self.model.joint(name).id] for name in ROBOT_JOINT_NAMES],
             dtype=int,
         )
-        self._robot_ctrl_slice = slice(0, len(ROBOT_JOINT_NAMES))
         self._arm_joint_names = ROBOT_JOINT_NAMES[:7]
+        self._finger_joint_names = ROBOT_JOINT_NAMES[7:]
         self._arm_joint_ids = np.array([self.model.joint(name).id for name in self._arm_joint_names], dtype=int)
         self._arm_qpos_adr = self._robot_qpos_adr[:7].copy()
-        self._arm_ctrl_slice = slice(0, len(self._arm_joint_names))
+        self._finger_qpos_adr = self._robot_qpos_adr[7:].copy()
         self._arm_joint_limits = self.model.jnt_range[self._arm_joint_ids].copy()
         self._robot_dof_adr = np.array(
             [self.model.jnt_dofadr[self.model.joint(name).id] for name in ROBOT_JOINT_NAMES],
             dtype=int,
         )
+        self._arm_dof_adr = self._robot_dof_adr[:7].copy()
+        self._finger_dof_adr = self._robot_dof_adr[7:].copy()
+        self._arm_actuator_ids = np.array([self.model.actuator(f"act_{name}").id for name in self._arm_joint_names], dtype=int)
+        self._finger_actuator_id = self.model.actuator("act_panda_finger_joint1").id
         self._wrist_camera_id = self.model.camera(WRIST_CAMERA_NAME).id
         self._grip_site_id = self.model.site("panda_grip_site").id
         self._first_cloud_saved = False
+        self._last_phase_name = ""
+        self._last_gripper_cmd = 0.0
 
         self._initialize_robot_state()
         self._initialize_scripted_teleop()
@@ -223,15 +234,20 @@ class Example:
 
     def _add_position_actuators(self, spec: mujoco.MjSpec) -> None:
         for joint_name in ROBOT_JOINT_NAMES:
+            if joint_name == "panda_finger_joint2":
+                continue
             is_finger = "finger" in joint_name
-            actuator = spec.add_actuator(
-                name=f"act_{joint_name}",
-                trntype=mujoco.mjtTrn.mjTRN_JOINT,
-                target=joint_name,
-            )
+            actuator_args = {
+                "name": f"act_{joint_name}",
+                "trntype": mujoco.mjtTrn.mjTRN_JOINT,
+                "target": joint_name,
+            }
+            if is_finger:
+                actuator_args["forcerange"] = [-FINGER_FORCE_LIMIT, FINGER_FORCE_LIMIT]
+            actuator = spec.add_actuator(**actuator_args)
             actuator.set_to_position(
-                kp=2000.0 if not is_finger else 200.0,
-                kv=200.0 if not is_finger else 20.0,
+                kp=2000.0 if not is_finger else FINGER_ACTUATOR_KP,
+                kv=200.0 if not is_finger else FINGER_ACTUATOR_KV,
             )
 
     def _add_rope_chain(self, spec: mujoco.MjSpec) -> None:
@@ -279,8 +295,16 @@ class Example:
     def _initialize_robot_state(self) -> None:
         for qpos_adr, qval in zip(self._robot_qpos_adr, self.target_joint_q, strict=True):
             self.data.qpos[qpos_adr] = qval
-        self.data.ctrl[self._robot_ctrl_slice] = self.target_joint_q
+        self._set_ctrl_targets()
         mujoco.mj_forward(self.model, self.data)
+
+    def _set_ctrl_targets(self, arm_q: np.ndarray | None = None, finger_q: float | None = None) -> None:
+        if arm_q is None:
+            arm_q = self.target_joint_q[:7]
+        if finger_q is None:
+            finger_q = float(self.target_joint_q[-2])
+        self.data.ctrl[self._arm_actuator_ids] = np.asarray(arm_q, dtype=float)
+        self.data.ctrl[self._finger_actuator_id] = float(finger_q)
 
     def _ee_site_pos(self) -> np.ndarray:
         return self.data.site_xpos[self._grip_site_id].astype(np.float64, copy=True)
@@ -327,7 +351,7 @@ class Example:
 
         def fk(q: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
             self.data.qpos[self._arm_qpos_adr] = q
-            self.data.ctrl[self._robot_ctrl_slice] = np.concatenate([q, self.target_joint_q[-2:]])
+            self._set_ctrl_targets(arm_q=q)
             mujoco.mj_forward(self.model, self.data)
             pos = self._ee_site_pos()
             rot = self._ee_site_rot()
@@ -458,11 +482,13 @@ class Example:
 
     def get_action(self) -> tuple[np.ndarray, np.ndarray, float]:
         step = self._scripted_steps[self._scripted_step_idx]
+        self._last_phase_name = str(step["name"])
         current_site_pos = self._ee_site_pos()
         pos_error = step["target_pos"] - current_site_pos
         delta_pos = _clip_vec(STEP_TARGET_GAIN * pos_error.astype(float, copy=False), EE_POS_DELTA_PER_STEP)
         delta_rot = np.zeros(3, dtype=float)
         gripper_cmd = float(step["gripper_cmd"])
+        self._last_gripper_cmd = gripper_cmd
 
         pos_reached = float(np.linalg.norm(pos_error)) < POSE_REACHED_TOL
         grip_reached = abs(float(self.target_joint_q[-1]) - GRIPPER_MIN) < GRIP_REACHED_TOL
@@ -474,7 +500,7 @@ class Example:
             delta_pos[:] = 0.0
             if pos_reached and grip_reached:
                 self._scripted_step_hold += 1
-                if self._scripted_step_hold >= 20:
+                if self._scripted_step_hold >= GRIP_HOLD_FRAMES:
                     self._advance_scripted_step()
         elif step["name"] == "lift" and pos_reached:
             delta_pos[:] = 0.0
@@ -501,14 +527,14 @@ class Example:
 
     def simulate(self) -> None:
         for _ in range(self.sim_substeps):
-            current_q = self.data.qpos[self._robot_qpos_adr].copy()
-            q_error = self.target_joint_q - current_q
+            current_q = self.data.qpos[self._arm_qpos_adr].copy()
+            q_error = self.target_joint_q[:7] - current_q
             q_step = np.clip(q_error, -KINEMATIC_QSTEP_PER_SUBSTEP, KINEMATIC_QSTEP_PER_SUBSTEP)
             next_q = current_q + q_step
 
-            self.data.qvel[self._robot_dof_adr] = q_step / self.sim_dt
-            self.data.qpos[self._robot_qpos_adr] = next_q
-            self.data.ctrl[self._robot_ctrl_slice] = self.target_joint_q
+            self.data.qvel[self._arm_dof_adr] = q_step / self.sim_dt
+            self.data.qpos[self._arm_qpos_adr] = next_q
+            self._set_ctrl_targets()
             mujoco.mj_forward(self.model, self.data)
             mujoco.mj_step(self.model, self.data)
 
@@ -523,23 +549,66 @@ class Example:
         self.renderer.update_scene(self.data, camera=self.camera)
         return self.renderer.render()
 
+    def _gripper_debug_row(self, frame_idx: int) -> dict[str, float | int | str]:
+        finger_q = self.data.qpos[self._finger_qpos_adr].astype(np.float64, copy=False)
+        finger_qd = self.data.qvel[self._finger_dof_adr].astype(np.float64, copy=False)
+        return {
+            "frame": frame_idx,
+            "sim_time": float(self.sim_time),
+            "phase": self._last_phase_name,
+            "gripper_cmd": float(self._last_gripper_cmd),
+            "target_left": float(self.target_joint_q[-2]),
+            "target_right": float(self.target_joint_q[-1]),
+            "ctrl_left": float(self.data.ctrl[self._finger_actuator_id]),
+            "ctrl_right": float(self.data.ctrl[self._finger_actuator_id]),
+            "qpos_left": float(finger_q[0]),
+            "qpos_right": float(finger_q[1]),
+            "qvel_left": float(finger_qd[0]),
+            "qvel_right": float(finger_qd[1]),
+        }
+
     def run(self) -> Path:
         output_path = Path(self.args.output).resolve()
         writer = VideoWriter(output_path, self.args.width, self.args.height, self.fps)
+        debug_path = output_path.with_suffix("")
+        debug_path = debug_path.with_name(f"{debug_path.name}_gripper_debug.csv")
+        debug_path.parent.mkdir(parents=True, exist_ok=True)
+        debug_file = debug_path.open("w", newline="")
+        debug_writer = csv.DictWriter(
+            debug_file,
+            fieldnames=[
+                "frame",
+                "sim_time",
+                "phase",
+                "gripper_cmd",
+                "target_left",
+                "target_right",
+                "ctrl_left",
+                "ctrl_right",
+                "qpos_left",
+                "qpos_right",
+                "qvel_left",
+                "qvel_right",
+            ],
+        )
+        debug_writer.writeheader()
 
         try:
             for frame_idx in range(self.args.num_frames):
                 self.step()
+                debug_writer.writerow(self._gripper_debug_row(frame_idx))
                 if frame_idx == 0:
                     self._save_first_point_cloud(output_path)
                 writer.write(self.render())
                 if (frame_idx + 1) % 60 == 0 or frame_idx + 1 == self.args.num_frames:
                     print(f"Rendered {frame_idx + 1}/{self.args.num_frames} frames")
         finally:
+            debug_file.close()
             writer.close()
             self.renderer.close()
             self.gl_context.free()
 
+        print(f"Saved gripper debug to {debug_path}")
         return output_path
 
 
@@ -547,7 +616,7 @@ def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Headless MuJoCo Franka + rope scene capture")
     parser.add_argument("--num-frames", type=int, default=300, help="Number of video frames to render")
     parser.add_argument("--fps", type=int, default=60, help="Video frame rate")
-    parser.add_argument("--sim-substeps", type=int, default=10, help="MuJoCo simulation substeps per video frame")
+    parser.add_argument("--sim-substeps", type=int, default=100, help="MuJoCo simulation substeps per video frame")
     parser.add_argument("--width", type=int, default=640, help="Video width")
     parser.add_argument("--height", type=int, default=480, help="Video height")
     parser.add_argument(

@@ -92,7 +92,7 @@
                       <body name="camera_link" pos="0.03 0 0.0587" quat="0 1 0 0">
                         <camera name="wrist_camera" fovy="60" quat="0.707107 0 0 -0.707107"/>
                       </body>
-                      <site name="panda_grip_site" pos="0 0 0.205" size="0.0001" rgba="0 0 0 0"/>
+                      <site name="panda_grip_site" pos="0 0 0.2" size="0.0001" rgba="0 0 0 0"/>
 
                       <body name="panda_leftfinger" pos="0 0 0.0584">
                         <joint
@@ -127,6 +127,7 @@
                           size="0.02 0.015 0.061"
                           pos="0 0.02 0.0875"
                           quat="0 0.707107 0.707107 0"
+                          friction="2.0 0.02 0.01"
                         />
                       </body>
 
@@ -163,6 +164,7 @@
                           size="0.02 0.015 0.061"
                           pos="0 -0.02 0.0875"
                           quat="0 -0.707107 0.707107 0"
+                          friction="2.0 0.02 0.01"
                         />
                       </body>
                     </body>
@@ -175,4 +177,15 @@
       </body>
     </body>
   </worldbody>
+
+  <equality>
+    <joint
+      name="panda_finger_coupling"
+      joint1="panda_finger_joint2"
+      joint2="panda_finger_joint1"
+      polycoef="0 1 0 0 0"
+      solref="0.001 2"
+      solimp="0.99 0.999 0.001"
+    />
+  </equality>
 </mujoco>
