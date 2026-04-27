@@ -62,10 +62,10 @@ IK_POS_WEIGHT = 5.0
 IK_ROT_WEIGHT = 4.0
 IK_REG_WEIGHT = 0.02
 ARM_ACTUATOR_KP = np.array([4500.0, 4500.0, 3500.0, 3500.0, 2000.0, 2000.0, 2000.0], dtype=float)
-ARM_ACTUATOR_KV = np.array([450.0, 450.0, 350.0, 350.0, 200.0, 200.0, 200.0], dtype=float)
-FINGER_ACTUATOR_KP = 700.0
+ARM_ACTUATOR_KV = np.array([450.0, 450.0, 350.0, 350.0, 200.0, 200.0, 200.0], dtype=float)/4.0
+FINGER_ACTUATOR_KP = 1000.0
 FINGER_ACTUATOR_KV = 48.0
-FINGER_FORCE_LIMIT = 60.0
+FINGER_FORCE_LIMIT = 1000.0
 
 ROPE_N_PARTICLES = 12
 ROPE_LENGTH = 0.5 / 2.0
@@ -193,6 +193,7 @@ class VideoWriter:
 class Example:
     def __init__(self, args: argparse.Namespace):
         self.args = args
+        self.scripted_mode = args.scripted_mode
         self.fps = args.fps
         self.frame_dt = 1.0 / self.fps
         self.sim_substeps = args.sim_substeps
@@ -239,6 +240,12 @@ class Example:
         self._last_gripper_cmd = 0.0
         self._scene_option: mujoco.MjvOption | None = None
         self._debug_prev_positions: dict[str, np.ndarray] = {}
+        self._last_ik_debug: dict[str, float | int] = {}
+        self._prev_target_arm_q = self.target_joint_q[:7].copy()
+        self._ee_pos_error_time_integral = 0.0
+        self._ee_rot_error_time_integral = 0.0
+        self._arm_joint_error_l2_time_integral = 0.0
+        self._arm_joint_error_max = 0.0
 
         self._initialize_robot_state()
         self._initialize_scripted_teleop()
@@ -385,9 +392,18 @@ class Example:
                 "gripper_cmd": 1.0,
             },
         ]
+        self._hold_initial_step = {
+            "name": "hold_initial",
+            "target_pos": grip_site_pos.copy(),
+            "gripper_cmd": 0.0,
+        }
+        if self.scripted_mode == "hold_initial":
+            self._active_scripted_steps = [self._hold_initial_step]
+        else:
+            self._active_scripted_steps = self._scripted_steps
         self._scripted_step_idx = 0
         self._scripted_step_hold = 0
-        print(f"Scripted teleop phase: {self._scripted_steps[self._scripted_step_idx]['name']}")
+        print(f"Scripted teleop phase: {self._active_scripted_steps[self._scripted_step_idx]['name']}")
 
     def _solve_arm_ik(self, target_pos: np.ndarray, target_rot: np.ndarray, q_seed: np.ndarray) -> np.ndarray:
         saved_qpos = self.data.qpos.copy()
@@ -420,6 +436,21 @@ class Example:
         pos, rot = fk(result.x)
         pos_err = float(np.linalg.norm(pos - target_pos))
         rot_err = float(np.linalg.norm(_rotation_error(target_rot, rot)))
+        weighted_residual = residual(result.x)
+        seed_delta = result.x - q_seed
+        self._last_ik_debug = {
+            "ik_success": int(bool(result.success)),
+            "ik_status": int(result.status),
+            "ik_cost": float(result.cost),
+            "ik_optimality": float(result.optimality),
+            "ik_nfev": int(result.nfev),
+            "ik_njev": int(getattr(result, "njev", -1)),
+            "ik_weighted_residual_norm": float(np.linalg.norm(weighted_residual)),
+            "ik_seed_delta_norm": float(np.linalg.norm(seed_delta)),
+            "ik_seed_delta_max_abs": float(np.max(np.abs(seed_delta))),
+            "ik_pos_err_norm": pos_err,
+            "ik_rot_err_norm": rot_err,
+        }
         if (not result.success) or pos_err > 2.0e-3 or rot_err > 2.0e-3:
             raise RuntimeError(
                 f"Failed to solve scripted IK for target {target_pos}: "
@@ -548,18 +579,21 @@ class Example:
         self._first_cloud_saved = True
 
     def _advance_scripted_step(self) -> None:
-        if self._scripted_step_idx >= len(self._scripted_steps) - 1:
+        if self._scripted_step_idx >= len(self._active_scripted_steps) - 1:
             return
         self._scripted_step_idx += 1
         self._scripted_step_hold = 0
-        print(f"Scripted teleop phase: {self._scripted_steps[self._scripted_step_idx]['name']}")
+        print(f"Scripted teleop phase: {self._active_scripted_steps[self._scripted_step_idx]['name']}")
 
     def get_action(self) -> tuple[np.ndarray, np.ndarray, float]:
-        step = self._scripted_steps[self._scripted_step_idx]
+        step = self._active_scripted_steps[self._scripted_step_idx]
         self._last_phase_name = str(step["name"])
         current_site_pos = self._ee_site_pos()
         pos_error = step["target_pos"] - current_site_pos
-        delta_pos = _clip_vec(STEP_TARGET_GAIN * pos_error.astype(float, copy=False), EE_POS_DELTA_PER_STEP)
+        if step["name"] == "hold_initial":
+            delta_pos = np.zeros(3, dtype=float)
+        else:
+            delta_pos = _clip_vec(STEP_TARGET_GAIN * pos_error.astype(float, copy=False), EE_POS_DELTA_PER_STEP)
         delta_rot = np.zeros(3, dtype=float)
         gripper_cmd = float(step["gripper_cmd"])
         self._last_gripper_cmd = gripper_cmd
@@ -618,9 +652,6 @@ class Example:
         self._update_renderer_scene(self.camera)
         return self.renderer.render()
 
-    def _geom_world_pos(self, geom_id: int) -> np.ndarray:
-        return self.data.geom_xpos[geom_id].astype(np.float64, copy=True)
-
     def _finite_difference_velocity(self, key: str, position: np.ndarray) -> np.ndarray:
         prev = self._debug_prev_positions.get(key)
         self._debug_prev_positions[key] = position.copy()
@@ -628,370 +659,150 @@ class Example:
             return np.zeros(3, dtype=np.float64)
         return (position - prev) / self.frame_dt
 
-    def _contact_debug_fieldnames(self) -> list[str]:
-        return [
-            "frame",
-            "sim_time",
-            "contact_id",
-            "geom1_id",
-            "geom1_name",
-            "geom2_id",
-            "geom2_name",
-            "is_left_finger",
-            "is_right_finger",
-            "is_rope",
-            "is_ground",
-            "is_finger_rope",
-            "is_rope_ground",
-            "is_finger_ground",
-            "rope_is_geom1",
-            "rope_is_geom2",
-            "left_is_geom1",
-            "left_is_geom2",
-            "right_is_geom1",
-            "right_is_geom2",
-            "body1_id",
-            "body1_name",
-            "body2_id",
-            "body2_name",
-            "dist",
-            "pos_x",
-            "pos_y",
-            "pos_z",
-            "normal_x",
-            "normal_y",
-            "normal_z",
-            "tangent1_x",
-            "tangent1_y",
-            "tangent1_z",
-            "tangent2_x",
-            "tangent2_y",
-            "tangent2_z",
-            "fn_local",
-            "ft1_local",
-            "ft2_local",
-            "torque_n_local",
-            "torque_t1_local",
-            "torque_t2_local",
-            "tangent_force_mag",
-            "force_world_x_raw",
-            "force_world_y_raw",
-            "force_world_z_raw",
-            "torque_world_x_raw",
-            "torque_world_y_raw",
-            "torque_world_z_raw",
-            "body1_point_vel_x",
-            "body1_point_vel_y",
-            "body1_point_vel_z",
-            "body2_point_vel_x",
-            "body2_point_vel_y",
-            "body2_point_vel_z",
-            "rel_point_vel_x",
-            "rel_point_vel_y",
-            "rel_point_vel_z",
-            "rel_normal_vel",
-            "rel_tangent1_vel",
-            "rel_tangent2_vel",
-            "rel_tangent_speed",
-        ]
-
-    def _point_velocity_world(self, body_id: int, point_world: np.ndarray) -> np.ndarray:
-        jacp = np.zeros((3, self.model.nv), dtype=np.float64)
-        mujoco.mj_jac(self.model, self.data, jacp, None, point_world, body_id)
-        return jacp @ self.data.qvel
-
-    def _collect_contact_debug(
-        self,
-        frame_idx: int,
-    ) -> tuple[dict[str, float | int], list[dict[str, float | int | str]]]:
+    def _contact_summary(self) -> dict[str, float | int]:
         summary: dict[str, float | int] = {
             "ncon_total": int(self.data.ncon),
             "ncon_finger_rope_total": 0,
-            "ncon_finger_rope_left": 0,
-            "ncon_finger_rope_right": 0,
             "ncon_rope_ground_total": 0,
             "ncon_finger_ground_total": 0,
             "finger_rope_normal_force_sum": 0.0,
-            "finger_rope_normal_force_sum_left": 0.0,
-            "finger_rope_normal_force_sum_right": 0.0,
-            "finger_rope_tangent_force_sum": 0.0,
-            "finger_rope_tangent_force_sum_left": 0.0,
-            "finger_rope_tangent_force_sum_right": 0.0,
             "rope_ground_normal_force_sum": 0.0,
-            "rope_ground_tangent_force_sum": 0.0,
-            "finger_rope_min_dist": np.inf,
-            "finger_rope_min_dist_left": np.inf,
-            "finger_rope_min_dist_right": np.inf,
-            "rope_ground_min_dist": np.inf,
-            "finger_rope_mean_pos_x": 0.0,
-            "finger_rope_mean_pos_y": 0.0,
-            "finger_rope_mean_pos_z": 0.0,
-            "finger_rope_mean_normal_x": 0.0,
-            "finger_rope_mean_normal_y": 0.0,
-            "finger_rope_mean_normal_z": 0.0,
         }
-        finger_rope_weight = 0.0
-        contact_rows: list[dict[str, float | int | str]] = []
 
         for contact_id in range(int(self.data.ncon)):
             contact = self.data.contact[contact_id]
             geom1 = int(contact.geom1)
             geom2 = int(contact.geom2)
-            geom1_name = self.model.geom(geom1).name or ""
-            geom2_name = self.model.geom(geom2).name or ""
-            body1 = int(self.model.geom_bodyid[geom1])
-            body2 = int(self.model.geom_bodyid[geom2])
-            body1_name = self.model.body(body1).name or ""
-            body2_name = self.model.body(body2).name or ""
 
             is_left_finger = geom1 == self._left_finger_collision_geom_id or geom2 == self._left_finger_collision_geom_id
             is_right_finger = geom1 == self._right_finger_collision_geom_id or geom2 == self._right_finger_collision_geom_id
             is_rope = geom1 in self._rope_geom_id_set or geom2 in self._rope_geom_id_set
             is_ground = geom1 == self._ground_geom_id or geom2 == self._ground_geom_id
             is_finger = is_left_finger or is_right_finger
-            is_finger_rope = is_finger and is_rope
-            is_rope_ground = is_rope and is_ground
-            is_finger_ground = is_finger and is_ground
 
-            contact_force = np.zeros(6, dtype=np.float64)
-            mujoco.mj_contactForce(self.model, self.data, contact_id, contact_force)
-            frame_axes = np.asarray(contact.frame, dtype=np.float64).reshape(-1)
-            normal = frame_axes[0:3].copy()
-            tangent1 = frame_axes[3:6].copy()
-            tangent2 = frame_axes[6:9].copy()
-            force_world = normal * contact_force[0] + tangent1 * contact_force[1] + tangent2 * contact_force[2]
-            torque_world = normal * contact_force[3] + tangent1 * contact_force[4] + tangent2 * contact_force[5]
-            tangent_force_mag = float(np.linalg.norm(contact_force[1:3]))
-            body1_point_vel = self._point_velocity_world(body1, np.asarray(contact.pos, dtype=np.float64))
-            body2_point_vel = self._point_velocity_world(body2, np.asarray(contact.pos, dtype=np.float64))
-            rel_point_vel = body2_point_vel - body1_point_vel
-            rel_normal_vel = float(np.dot(rel_point_vel, normal))
-            rel_tangent1_vel = float(np.dot(rel_point_vel, tangent1))
-            rel_tangent2_vel = float(np.dot(rel_point_vel, tangent2))
-            rel_tangent_speed = float(np.linalg.norm([rel_tangent1_vel, rel_tangent2_vel]))
-
-            if is_finger_rope:
+            if is_finger and is_rope:
                 summary["ncon_finger_rope_total"] = int(summary["ncon_finger_rope_total"]) + 1
-                summary["finger_rope_normal_force_sum"] = float(summary["finger_rope_normal_force_sum"]) + float(contact_force[0])
-                summary["finger_rope_tangent_force_sum"] = float(summary["finger_rope_tangent_force_sum"]) + tangent_force_mag
-                summary["finger_rope_min_dist"] = min(float(summary["finger_rope_min_dist"]), float(contact.dist))
-                weight = max(abs(float(contact_force[0])), 1.0e-8)
-                summary["finger_rope_mean_pos_x"] = float(summary["finger_rope_mean_pos_x"]) + weight * float(contact.pos[0])
-                summary["finger_rope_mean_pos_y"] = float(summary["finger_rope_mean_pos_y"]) + weight * float(contact.pos[1])
-                summary["finger_rope_mean_pos_z"] = float(summary["finger_rope_mean_pos_z"]) + weight * float(contact.pos[2])
-                summary["finger_rope_mean_normal_x"] = float(summary["finger_rope_mean_normal_x"]) + weight * float(normal[0])
-                summary["finger_rope_mean_normal_y"] = float(summary["finger_rope_mean_normal_y"]) + weight * float(normal[1])
-                summary["finger_rope_mean_normal_z"] = float(summary["finger_rope_mean_normal_z"]) + weight * float(normal[2])
-                finger_rope_weight += weight
-                if is_left_finger:
-                    summary["ncon_finger_rope_left"] = int(summary["ncon_finger_rope_left"]) + 1
-                    summary["finger_rope_normal_force_sum_left"] = float(summary["finger_rope_normal_force_sum_left"]) + float(contact_force[0])
-                    summary["finger_rope_tangent_force_sum_left"] = (
-                        float(summary["finger_rope_tangent_force_sum_left"]) + tangent_force_mag
-                    )
-                    summary["finger_rope_min_dist_left"] = min(float(summary["finger_rope_min_dist_left"]), float(contact.dist))
-                if is_right_finger:
-                    summary["ncon_finger_rope_right"] = int(summary["ncon_finger_rope_right"]) + 1
-                    summary["finger_rope_normal_force_sum_right"] = float(summary["finger_rope_normal_force_sum_right"]) + float(contact_force[0])
-                    summary["finger_rope_tangent_force_sum_right"] = (
-                        float(summary["finger_rope_tangent_force_sum_right"]) + tangent_force_mag
-                    )
-                    summary["finger_rope_min_dist_right"] = min(float(summary["finger_rope_min_dist_right"]), float(contact.dist))
-
-            if is_rope_ground:
+                contact_force = np.zeros(6, dtype=np.float64)
+                mujoco.mj_contactForce(self.model, self.data, contact_id, contact_force)
+                summary["finger_rope_normal_force_sum"] = float(summary["finger_rope_normal_force_sum"]) + float(
+                    contact_force[0]
+                )
+            elif is_rope and is_ground:
                 summary["ncon_rope_ground_total"] = int(summary["ncon_rope_ground_total"]) + 1
-                summary["rope_ground_normal_force_sum"] = float(summary["rope_ground_normal_force_sum"]) + float(contact_force[0])
-                summary["rope_ground_tangent_force_sum"] = float(summary["rope_ground_tangent_force_sum"]) + tangent_force_mag
-                summary["rope_ground_min_dist"] = min(float(summary["rope_ground_min_dist"]), float(contact.dist))
-
-            if is_finger_ground:
+                contact_force = np.zeros(6, dtype=np.float64)
+                mujoco.mj_contactForce(self.model, self.data, contact_id, contact_force)
+                summary["rope_ground_normal_force_sum"] = float(summary["rope_ground_normal_force_sum"]) + float(
+                    contact_force[0]
+                )
+            elif is_finger and is_ground:
                 summary["ncon_finger_ground_total"] = int(summary["ncon_finger_ground_total"]) + 1
 
-            contact_rows.append(
-                {
-                    "frame": frame_idx,
-                    "sim_time": float(self.sim_time),
-                    "contact_id": contact_id,
-                    "geom1_id": geom1,
-                    "geom1_name": geom1_name,
-                    "geom2_id": geom2,
-                    "geom2_name": geom2_name,
-                    "is_left_finger": int(is_left_finger),
-                    "is_right_finger": int(is_right_finger),
-                    "is_rope": int(is_rope),
-                    "is_ground": int(is_ground),
-                    "is_finger_rope": int(is_finger_rope),
-                    "is_rope_ground": int(is_rope_ground),
-                    "is_finger_ground": int(is_finger_ground),
-                    "rope_is_geom1": int(geom1 in self._rope_geom_id_set),
-                    "rope_is_geom2": int(geom2 in self._rope_geom_id_set),
-                    "left_is_geom1": int(geom1 == self._left_finger_collision_geom_id),
-                    "left_is_geom2": int(geom2 == self._left_finger_collision_geom_id),
-                    "right_is_geom1": int(geom1 == self._right_finger_collision_geom_id),
-                    "right_is_geom2": int(geom2 == self._right_finger_collision_geom_id),
-                    "body1_id": body1,
-                    "body1_name": body1_name,
-                    "body2_id": body2,
-                    "body2_name": body2_name,
-                    "dist": float(contact.dist),
-                    "pos_x": float(contact.pos[0]),
-                    "pos_y": float(contact.pos[1]),
-                    "pos_z": float(contact.pos[2]),
-                    "normal_x": float(normal[0]),
-                    "normal_y": float(normal[1]),
-                    "normal_z": float(normal[2]),
-                    "tangent1_x": float(tangent1[0]),
-                    "tangent1_y": float(tangent1[1]),
-                    "tangent1_z": float(tangent1[2]),
-                    "tangent2_x": float(tangent2[0]),
-                    "tangent2_y": float(tangent2[1]),
-                    "tangent2_z": float(tangent2[2]),
-                    "fn_local": float(contact_force[0]),
-                    "ft1_local": float(contact_force[1]),
-                    "ft2_local": float(contact_force[2]),
-                    "torque_n_local": float(contact_force[3]),
-                    "torque_t1_local": float(contact_force[4]),
-                    "torque_t2_local": float(contact_force[5]),
-                    "tangent_force_mag": tangent_force_mag,
-                    "force_world_x_raw": float(force_world[0]),
-                    "force_world_y_raw": float(force_world[1]),
-                    "force_world_z_raw": float(force_world[2]),
-                    "torque_world_x_raw": float(torque_world[0]),
-                    "torque_world_y_raw": float(torque_world[1]),
-                    "torque_world_z_raw": float(torque_world[2]),
-                    "body1_point_vel_x": float(body1_point_vel[0]),
-                    "body1_point_vel_y": float(body1_point_vel[1]),
-                    "body1_point_vel_z": float(body1_point_vel[2]),
-                    "body2_point_vel_x": float(body2_point_vel[0]),
-                    "body2_point_vel_y": float(body2_point_vel[1]),
-                    "body2_point_vel_z": float(body2_point_vel[2]),
-                    "rel_point_vel_x": float(rel_point_vel[0]),
-                    "rel_point_vel_y": float(rel_point_vel[1]),
-                    "rel_point_vel_z": float(rel_point_vel[2]),
-                    "rel_normal_vel": rel_normal_vel,
-                    "rel_tangent1_vel": rel_tangent1_vel,
-                    "rel_tangent2_vel": rel_tangent2_vel,
-                    "rel_tangent_speed": rel_tangent_speed,
-                }
-            )
+        return summary
 
-        if finger_rope_weight > 0.0:
-            summary["finger_rope_mean_pos_x"] = float(summary["finger_rope_mean_pos_x"]) / finger_rope_weight
-            summary["finger_rope_mean_pos_y"] = float(summary["finger_rope_mean_pos_y"]) / finger_rope_weight
-            summary["finger_rope_mean_pos_z"] = float(summary["finger_rope_mean_pos_z"]) / finger_rope_weight
-            summary["finger_rope_mean_normal_x"] = float(summary["finger_rope_mean_normal_x"]) / finger_rope_weight
-            summary["finger_rope_mean_normal_y"] = float(summary["finger_rope_mean_normal_y"]) / finger_rope_weight
-            summary["finger_rope_mean_normal_z"] = float(summary["finger_rope_mean_normal_z"]) / finger_rope_weight
-        else:
-            summary["finger_rope_mean_pos_x"] = np.nan
-            summary["finger_rope_mean_pos_y"] = np.nan
-            summary["finger_rope_mean_pos_z"] = np.nan
-            summary["finger_rope_mean_normal_x"] = np.nan
-            summary["finger_rope_mean_normal_y"] = np.nan
-            summary["finger_rope_mean_normal_z"] = np.nan
+    def _control_debug_row(self, frame_idx: int) -> dict[str, float | int | str]:
+        arm_q = self.data.qpos[self._arm_qpos_adr].astype(np.float64, copy=False)
+        arm_qd = self.data.qvel[self._arm_dof_adr].astype(np.float64, copy=False)
+        target_arm_q = self.target_joint_q[:7].astype(np.float64, copy=False)
+        arm_q_err = target_arm_q - arm_q
+        arm_q_err_abs = np.abs(arm_q_err)
+        arm_q_err_l2 = float(np.linalg.norm(arm_q_err))
+        arm_q_err_max = float(np.max(arm_q_err_abs))
+        arm_target_delta = target_arm_q - self._prev_target_arm_q
+        self._prev_target_arm_q = target_arm_q.copy()
 
-        for key in (
-            "finger_rope_min_dist",
-            "finger_rope_min_dist_left",
-            "finger_rope_min_dist_right",
-            "rope_ground_min_dist",
-        ):
-            if not np.isfinite(float(summary[key])):
-                summary[key] = np.nan
-
-        return summary, contact_rows
-
-    def _gripper_debug_row(
-        self,
-        frame_idx: int,
-        contact_summary: dict[str, float | int],
-    ) -> dict[str, float | int | str]:
         finger_q = self.data.qpos[self._finger_qpos_adr].astype(np.float64, copy=False)
         finger_qd = self.data.qvel[self._finger_dof_adr].astype(np.float64, copy=False)
+        finger_target = self.target_joint_q[-2:].astype(np.float64, copy=False)
+        finger_q_err = finger_target - finger_q
+
         ee_pos = self._ee_site_pos()
+        ee_rot = self._ee_site_rot()
         ee_vel = self._finite_difference_velocity("ee_site", ee_pos)
-        rope_root_pos = self._geom_world_pos(self._rope_root_geom_id)
-        rope_mid_pos = self._geom_world_pos(self._rope_mid_geom_id)
-        rope_tip_pos = self._geom_world_pos(self._rope_tip_geom_id)
-        rope_root_vel = self._finite_difference_velocity("rope_root", rope_root_pos)
-        rope_mid_vel = self._finite_difference_velocity("rope_mid", rope_mid_pos)
-        rope_tip_vel = self._finite_difference_velocity("rope_tip", rope_tip_pos)
-        target_gap = FINGER_BOX_BASE_GAP + float(self.target_joint_q[-2]) + float(self.target_joint_q[-1])
-        actual_gap = FINGER_BOX_BASE_GAP + float(finger_q[0]) + float(finger_q[1])
-        ee_err = self.ee_target_pos - ee_pos
-        return {
+        ee_pos_err = self.ee_target_pos - ee_pos
+        ee_rot_err = _rotation_error(self.ee_target_rot, ee_rot)
+        ee_pos_err_norm = float(np.linalg.norm(ee_pos_err))
+        ee_rot_err_norm = float(np.linalg.norm(ee_rot_err))
+
+        self._ee_pos_error_time_integral += ee_pos_err_norm * self.frame_dt
+        self._ee_rot_error_time_integral += ee_rot_err_norm * self.frame_dt
+        self._arm_joint_error_l2_time_integral += arm_q_err_l2 * self.frame_dt
+        self._arm_joint_error_max = max(self._arm_joint_error_max, arm_q_err_max)
+
+        contact_summary = self._contact_summary()
+
+        row: dict[str, float | int | str] = {
             "frame": frame_idx,
             "sim_time": float(self.sim_time),
             "phase": self._last_phase_name,
+            "scripted_mode": self.scripted_mode,
             "gripper_cmd": float(self._last_gripper_cmd),
-            "target_left": float(self.target_joint_q[-2]),
-            "target_right": float(self.target_joint_q[-1]),
-            "ctrl_left": float(self.data.ctrl[self._finger_actuator_id]),
-            "ctrl_right": float(self.data.ctrl[self._finger_actuator_id]),
-            "qpos_left": float(finger_q[0]),
-            "qpos_right": float(finger_q[1]),
-            "qvel_left": float(finger_qd[0]),
-            "qvel_right": float(finger_qd[1]),
-            "target_gap_est": target_gap,
-            "actual_gap_est": actual_gap,
-            "gap_error": target_gap - actual_gap,
-            "ee_pos_x": float(ee_pos[0]),
-            "ee_pos_y": float(ee_pos[1]),
-            "ee_pos_z": float(ee_pos[2]),
             "ee_target_x": float(self.ee_target_pos[0]),
             "ee_target_y": float(self.ee_target_pos[1]),
             "ee_target_z": float(self.ee_target_pos[2]),
-            "ee_err_x": float(ee_err[0]),
-            "ee_err_y": float(ee_err[1]),
-            "ee_err_z": float(ee_err[2]),
+            "ee_pos_x": float(ee_pos[0]),
+            "ee_pos_y": float(ee_pos[1]),
+            "ee_pos_z": float(ee_pos[2]),
+            "ee_err_x": float(ee_pos_err[0]),
+            "ee_err_y": float(ee_pos_err[1]),
+            "ee_err_z": float(ee_pos_err[2]),
+            "ee_pos_err_norm": ee_pos_err_norm,
+            "ee_rot_err_x": float(ee_rot_err[0]),
+            "ee_rot_err_y": float(ee_rot_err[1]),
+            "ee_rot_err_z": float(ee_rot_err[2]),
+            "ee_rot_err_norm": ee_rot_err_norm,
             "ee_vel_x": float(ee_vel[0]),
             "ee_vel_y": float(ee_vel[1]),
             "ee_vel_z": float(ee_vel[2]),
-            "rope_root_pos_x": float(rope_root_pos[0]),
-            "rope_root_pos_y": float(rope_root_pos[1]),
-            "rope_root_pos_z": float(rope_root_pos[2]),
-            "rope_mid_pos_x": float(rope_mid_pos[0]),
-            "rope_mid_pos_y": float(rope_mid_pos[1]),
-            "rope_mid_pos_z": float(rope_mid_pos[2]),
-            "rope_tip_pos_x": float(rope_tip_pos[0]),
-            "rope_tip_pos_y": float(rope_tip_pos[1]),
-            "rope_tip_pos_z": float(rope_tip_pos[2]),
-            "rope_root_vel_x": float(rope_root_vel[0]),
-            "rope_root_vel_y": float(rope_root_vel[1]),
-            "rope_root_vel_z": float(rope_root_vel[2]),
-            "rope_mid_vel_x": float(rope_mid_vel[0]),
-            "rope_mid_vel_y": float(rope_mid_vel[1]),
-            "rope_mid_vel_z": float(rope_mid_vel[2]),
-            "rope_tip_vel_x": float(rope_tip_vel[0]),
-            "rope_tip_vel_y": float(rope_tip_vel[1]),
-            "rope_tip_vel_z": float(rope_tip_vel[2]),
-            **contact_summary,
+            "arm_joint_err_l2": arm_q_err_l2,
+            "arm_joint_err_max_abs": arm_q_err_max,
+            "arm_target_delta_l2": float(np.linalg.norm(arm_target_delta)),
+            "arm_target_delta_max_abs": float(np.max(np.abs(arm_target_delta))),
+            "arm_qvel_l2": float(np.linalg.norm(arm_qd)),
+            "ee_pos_error_time_integral": self._ee_pos_error_time_integral,
+            "ee_rot_error_time_integral": self._ee_rot_error_time_integral,
+            "arm_joint_error_l2_time_integral": self._arm_joint_error_l2_time_integral,
+            "arm_joint_error_max_running": self._arm_joint_error_max,
+            "finger_left_target": float(finger_target[0]),
+            "finger_right_target": float(finger_target[1]),
+            "finger_left_qpos": float(finger_q[0]),
+            "finger_right_qpos": float(finger_q[1]),
+            "finger_left_qvel": float(finger_qd[0]),
+            "finger_right_qvel": float(finger_qd[1]),
+            "finger_left_err": float(finger_q_err[0]),
+            "finger_right_err": float(finger_q_err[1]),
+            "arm_ctrl_l2": float(np.linalg.norm(self.data.ctrl[self._arm_actuator_ids])),
+            "finger_ctrl": float(self.data.ctrl[self._finger_actuator_id]),
         }
+        row.update(self._last_ik_debug)
+        row.update(contact_summary)
+
+        for joint_idx, joint_name in enumerate(self._arm_joint_names):
+            row[f"{joint_name}_target"] = float(target_arm_q[joint_idx])
+            row[f"{joint_name}_qpos"] = float(arm_q[joint_idx])
+            row[f"{joint_name}_qvel"] = float(arm_qd[joint_idx])
+            row[f"{joint_name}_err"] = float(arm_q_err[joint_idx])
+            row[f"{joint_name}_actuator_force"] = float(self.data.actuator_force[self._arm_actuator_ids[joint_idx]])
+            row[f"{joint_name}_qfrc_bias"] = float(self.data.qfrc_bias[self._arm_dof_adr[joint_idx]])
+
+        return row
 
     def run(self) -> Path:
         output_path = Path(self.args.output).resolve()
         writer = VideoWriter(output_path, self.args.width, self.args.height, self.fps)
         debug_path = output_path.with_suffix("")
-        debug_path = debug_path.with_name(f"{debug_path.name}_gripper_debug.csv")
-        contact_debug_path = debug_path.with_name(f"{output_path.with_suffix('').name}_contact_debug.csv")
+        debug_path = debug_path.with_name(f"{debug_path.name}_control_debug.csv")
         debug_path.parent.mkdir(parents=True, exist_ok=True)
         debug_file = debug_path.open("w", newline="")
-        contact_debug_file = contact_debug_path.open("w", newline="")
         debug_writer: csv.DictWriter | None = None
-        contact_debug_writer = csv.DictWriter(contact_debug_file, fieldnames=self._contact_debug_fieldnames())
-        contact_debug_writer.writeheader()
 
         try:
             for frame_idx in range(self.args.num_frames):
                 self.step()
-                contact_summary, contact_rows = self._collect_contact_debug(frame_idx)
-                frame_row = self._gripper_debug_row(frame_idx, contact_summary)
+                frame_row = self._control_debug_row(frame_idx)
                 if debug_writer is None:
                     debug_writer = csv.DictWriter(debug_file, fieldnames=list(frame_row.keys()))
                     debug_writer.writeheader()
                 debug_writer.writerow(frame_row)
-                for contact_row in contact_rows:
-                    contact_debug_writer.writerow(contact_row)
                 if frame_idx == 0:
                     self._save_first_point_cloud(output_path)
                 writer.write(self.render())
@@ -999,13 +810,11 @@ class Example:
                     print(f"Rendered {frame_idx + 1}/{self.args.num_frames} frames")
         finally:
             debug_file.close()
-            contact_debug_file.close()
             writer.close()
             self.renderer.close()
             self.gl_context.free()
 
-        print(f"Saved gripper debug to {debug_path}")
-        print(f"Saved contact debug to {contact_debug_path}")
+        print(f"Saved control debug to {debug_path}")
         return output_path
 
 
@@ -1032,6 +841,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--render-gripper-collision",
         action="store_true",
         help="Render fingertip collision boxes for grasp debugging",
+    )
+    parser.add_argument(
+        "--scripted-mode",
+        choices=["hold_initial", "sequence"],
+        default="hold_initial",
+        help="Hold the initial end-effector pose for diagnostics or run the full scripted sequence",
     )
     return parser
 
