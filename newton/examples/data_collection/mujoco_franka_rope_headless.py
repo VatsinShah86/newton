@@ -56,13 +56,13 @@ LIFT_HEIGHT = 0.10
 EE_POS_DELTA_PER_STEP = 0.003
 POSE_REACHED_TOL = 0.006
 GRIP_REACHED_TOL = 0.004
-GRIP_HOLD_FRAMES = 45
+GRIP_HOLD_FRAMES = 0
 STEP_TARGET_GAIN = 0.35
 IK_POS_WEIGHT = 5.0
 IK_ROT_WEIGHT = 4.0
 IK_REG_WEIGHT = 0.02
-ARM_ACTUATOR_KP = 3500.0
-ARM_ACTUATOR_KV = 300.0
+ARM_ACTUATOR_KP = np.array([4500.0, 4500.0, 3500.0, 3500.0, 2000.0, 2000.0, 2000.0], dtype=float)
+ARM_ACTUATOR_KV = np.array([450.0, 450.0, 350.0, 350.0, 200.0, 200.0, 200.0], dtype=float)
 FINGER_ACTUATOR_KP = 700.0
 FINGER_ACTUATOR_KV = 48.0
 FINGER_FORCE_LIMIT = 60.0
@@ -96,6 +96,20 @@ GRIPPER_VISUAL_GEOM_NAMES = (
 GRIPPER_COLLISION_GEOM_NAMES = (
     "panda_leftfinger_collision",
     "panda_rightfinger_collision",
+)
+ROBOT_GRAVCOMP_BODY_NAMES = (
+    "panda_link0",
+    "panda_link1",
+    "panda_link2",
+    "panda_link3",
+    "panda_link4",
+    "panda_link5",
+    "panda_link6",
+    "panda_link7",
+    "panda_hand",
+    "camera_link",
+    "panda_leftfinger",
+    "panda_rightfinger",
 )
 
 def _asset_root() -> Path:
@@ -188,6 +202,7 @@ class Example:
         self.spec = self._build_spec()
         self.model = self.spec.compile()
         self.model.opt.timestep = self.sim_dt
+        self._configure_robot_gravcomp()
         self.data = mujoco.MjData(self.model)
 
         self.target_joint_q = np.concatenate([ARM_REST_Q, [GRIPPER_MAX, GRIPPER_MAX]]).astype(float)
@@ -254,7 +269,7 @@ class Example:
         return spec
 
     def _add_position_actuators(self, spec: mujoco.MjSpec) -> None:
-        for joint_name in ROBOT_JOINT_NAMES:
+        for joint_idx, joint_name in enumerate(ROBOT_JOINT_NAMES):
             if joint_name == "panda_finger_joint2":
                 continue
             is_finger = "finger" in joint_name
@@ -267,9 +282,15 @@ class Example:
                 actuator_args["forcerange"] = [-FINGER_FORCE_LIMIT, FINGER_FORCE_LIMIT]
             actuator = spec.add_actuator(**actuator_args)
             actuator.set_to_position(
-                kp=ARM_ACTUATOR_KP if not is_finger else FINGER_ACTUATOR_KP,
-                kv=ARM_ACTUATOR_KV if not is_finger else FINGER_ACTUATOR_KV,
+                kp=float(ARM_ACTUATOR_KP[joint_idx]) if not is_finger else FINGER_ACTUATOR_KP,
+                kv=float(ARM_ACTUATOR_KV[joint_idx]) if not is_finger else FINGER_ACTUATOR_KV,
             )
+
+    def _configure_robot_gravcomp(self) -> None:
+        # Compensate the robot link masses directly so pose tracking is not
+        # dominated by gravity sag between IK solves.
+        for body_name in ROBOT_GRAVCOMP_BODY_NAMES:
+            self.model.body_gravcomp[self.model.body(body_name).id] = 1.0
 
     def _add_rope_chain(self, spec: mujoco.MjSpec) -> None:
         seg_len = ROPE_LENGTH / (ROPE_N_PARTICLES - 1)
@@ -551,6 +572,7 @@ class Example:
                 self._advance_scripted_step()
         elif step["name"] == "grip":
             delta_pos[:] = 0.0
+            print(f"pos reached: {pos_reached}")
             if pos_reached and grip_reached:
                 self._scripted_step_hold += 1
                 if self._scripted_step_hold >= GRIP_HOLD_FRAMES:
