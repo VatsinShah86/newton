@@ -123,10 +123,9 @@
                         <geom
                           name="panda_leftfinger_collision"
                           class="collision"
-                          type="box"
-                          size="0.02 0.015 0.061"
-                          pos="0 0.02 0.0875"
-                          quat="0 0.707107 0.707107 0"
+                          type="capsule"
+                          fromto="0 0.02 0.0265  0 0.02 0.065"
+                          size="0.011"
                           condim="6"
                           friction="4.0 0.05 0.02"
                         />
@@ -161,10 +160,9 @@
                         <geom
                           name="panda_rightfinger_collision"
                           class="collision"
-                          type="box"
-                          size="0.02 0.015 0.061"
-                          pos="0 -0.02 0.0875"
-                          quat="0 -0.707107 0.707107 0"
+                          type="capsule"
+                          fromto="0 -0.02 0.0265  0 -0.02 0.065"
+                          size="0.011"
                           condim="6"
                           friction="4.0 0.05 0.02"
                         />
