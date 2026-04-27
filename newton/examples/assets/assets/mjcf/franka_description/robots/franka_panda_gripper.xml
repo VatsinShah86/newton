@@ -125,9 +125,9 @@
                           class="collision"
                           type="box"
                           pos="0 0 0.1516"
-                          size="0.008 0.011 0.020"
-                          condim="6"
-                          friction="4.0 0.05 0.02"
+                          size="0.008 0.011 0.018"
+                          condim="3"
+                          friction="2.0 0.05 0.02"
                         />
                       </body>
 
@@ -162,9 +162,9 @@
                           class="collision"
                           type="box"
                           pos="0 0 0.1516"
-                          size="0.008 0.011 0.020"
-                          condim="6"
-                          friction="4.0 0.05 0.02"
+                          size="0.008 0.011 0.018"
+                          condim="3"
+                          friction="2.0 0.05 0.02"
                         />
                       </body>
                     </body>

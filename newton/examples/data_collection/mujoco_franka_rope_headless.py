@@ -33,7 +33,7 @@ from pathlib import Path
 import numpy as np
 from scipy.optimize import least_squares
 
-os.environ.setdefault("MUJOCO_GL", "osmesa")
+os.environ.setdefault("MUJOCO_GL", "egl")
 os.environ.setdefault("PYOPENGL_PLATFORM", os.environ["MUJOCO_GL"])
 os.environ.setdefault("MESA_SHADER_CACHE_DISABLE", "true")
 
@@ -66,12 +66,12 @@ ARM_ACTUATOR_KV = np.array([450.0, 450.0, 350.0, 350.0, 200.0, 200.0, 200.0], dt
 FINGER_ACTUATOR_KP = 1000.0
 FINGER_ACTUATOR_KV = 48.0
 FINGER_FORCE_LIMIT = 100.0
-ROPE_CONTACT_FRICTION = np.array([1.5, 0.03, 0.01], dtype=float)
+ROPE_CONTACT_FRICTION = np.array([0.01, 0.03, 0.01], dtype=float)
 
-ROPE_N_PARTICLES = 12
+ROPE_N_PARTICLES = 20
 ROPE_LENGTH = 0.5 / 2.0
-ROPE_RADIUS = 0.008
-GRIPPER_MIN = ROPE_RADIUS - 0.003
+ROPE_RADIUS = 0.003
+GRIPPER_MIN = 0 #ROPE_RADIUS - 0.003
 
 ROBOT_BASE_POS = np.array([-0.5, -0.5, -0.1], dtype=float)
 ROPE_START = np.array([-0.2, -0.3, ROPE_RADIUS + 0.002], dtype=float)
@@ -318,7 +318,7 @@ class Example:
             type=mujoco.mjtGeom.mjGEOM_CAPSULE,
             fromto=[0.0, 0.0, 0.0, seg_len, 0.0, 0.0],
             size=[ROPE_RADIUS],
-            condim=6,
+            condim=3,
             density=density,
             friction=friction,
             rgba=color,
@@ -337,7 +337,7 @@ class Example:
                 type=mujoco.mjtGeom.mjGEOM_CAPSULE,
                 fromto=[0.0, 0.0, 0.0, seg_len, 0.0, 0.0],
                 size=[ROPE_RADIUS],
-                condim=6,
+                condim=3,
                 density=density,
                 friction=friction,
                 rgba=color,
