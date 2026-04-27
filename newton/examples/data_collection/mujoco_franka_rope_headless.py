@@ -65,7 +65,8 @@ ARM_ACTUATOR_KP = np.array([4500.0, 4500.0, 3500.0, 3500.0, 2000.0, 2000.0, 2000
 ARM_ACTUATOR_KV = np.array([450.0, 450.0, 350.0, 350.0, 200.0, 200.0, 200.0], dtype=float)/4.0
 FINGER_ACTUATOR_KP = 1000.0
 FINGER_ACTUATOR_KV = 48.0
-FINGER_FORCE_LIMIT = 1000.0
+FINGER_FORCE_LIMIT = 100.0
+ROPE_CONTACT_FRICTION = np.array([1.5, 0.03, 0.01], dtype=float)
 
 ROPE_N_PARTICLES = 12
 ROPE_LENGTH = 0.5 / 2.0
@@ -301,8 +302,8 @@ class Example:
 
     def _add_rope_chain(self, spec: mujoco.MjSpec) -> None:
         seg_len = ROPE_LENGTH / (ROPE_N_PARTICLES - 1)
-        density = 200.0
-        friction = [1.5, 0.03, 0.01]
+        density = 10.0
+        friction = ROPE_CONTACT_FRICTION.tolist()
         color = [0.45, 0.27, 0.08, 1.0]
 
         parent = spec.worldbody.add_body(name="rope_0", pos=ROPE_START.tolist())
@@ -606,7 +607,6 @@ class Example:
                 self._advance_scripted_step()
         elif step["name"] == "grip":
             delta_pos[:] = 0.0
-            print(f"pos reached: {pos_reached}")
             if pos_reached and grip_reached:
                 self._scripted_step_hold += 1
                 if self._scripted_step_hold >= GRIP_HOLD_FRAMES:
